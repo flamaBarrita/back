@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # --- BASE DE DATOS (PostGIS) ---
+  db:
+    image: postgis/postgis:15-3.4
+    container_name: rides_db
+    restart: always
+    environment:
+      POSTGRES_USER: adminflama
+      POSTGRES_PASSWORD: M0v1l--UA01
+      POSTGRES_DB: rides_db
+    volumes:
+      - ./data/pg_data:/var/lib/postgresql/data
+    networks:
+      - rides_network
+    # AJUSTE LOCAL: Configuración estándar (sin consumo excesivo de RAM)
+    # Quitamos el comando de optimización de 60GB. 
+    # Usará los defaults de Postgres (aprox 128MB RAM), perfecto para dev.
+
+    ports:
+      - "5432:5432"
+
+  # --- CACHÉ (Redis) ---
+  redis:
+    image: redis:7-alpine
+    container_name: rides_redis
+    restart: always
+    volumes:
+      - ./data/redis_data:/data
+    networks:
+      - rides_network
+
+  # --- BACKEND (FastAPI) ---
+  backend:
+    build:
+      context: ./backend
+    container_name: rides_api
+    restart: always
+    environment:
+      # En Docker, 'db' es el hostname, no localhost
+      DATABASE_URL: postgresql+asyncpg://adminflama:M0v1l--UA01@db:5432/rides_db
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    networks:
+      - rides_network
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    # AJUSTE LOCAL: Habilitamos --reload para que si cambias código, se actualice solo
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+networks:
+  rides_network:
+    driver: bridge
