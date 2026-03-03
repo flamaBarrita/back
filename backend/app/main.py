@@ -293,7 +293,7 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     query = """
         SELECT 
             t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available,
-            u.name AS driver_name, u.photo_url AS driver_photo, u.rating, u.vehicles AS car
+            u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles
         FROM trips t
         JOIN drivers u ON t.driver_id = u.id
         WHERE t.status = 'activo' 
