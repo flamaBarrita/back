@@ -194,30 +194,44 @@ async def create_initial_user(user_id: str, user: UserCreate):
     
 @app.post("/trips/{driver_id}")
 async def create_trip(driver_id: str, trip: TripCreate):
+    conn = None
     try:
+        # 1. Asegúrate de que la URL no tenga el driver '+asyncpg'
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
+        # 2. Query corregida (sin la 'x' intrusa)
         query = """
             INSERT INTO trips 
-            (driver_id, origin_name,x origin_lat, origin_lng, dest_name, dest_lat, dest_lng, distance_text, duration_text) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;
+            (driver_id, origin_name, origin_lat, origin_lng, dest_name, dest_lat, dest_lng, distance_text, duration_text) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+            RETURNING id;
         """
         
-        # Guardamos en Postgres
+        # 3. Ejecución
         new_trip = await conn.fetchrow(
             query, 
-            driver_id, 
-            trip.origin_name, trip.origin_lat, trip.origin_lng,
-            trip.dest_name, trip.dest_lat, trip.dest_lng,
-            trip.distance_text, trip.duration_text
+            driver_id,  # Se envía como string, Postgres lo casteará a varchar(255)
+            trip.origin_name, 
+            trip.origin_lat, 
+            trip.origin_lng,
+            trip.dest_name, 
+            trip.dest_lat, 
+            trip.dest_lng,
+            trip.distance_text, 
+            trip.duration_text
         )
         
-        await conn.close()
         return {"message": "Viaje publicado con éxito", "trip_id": new_trip["id"]}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Esto te ayudará a ver el error real en la consola de la app
+        print(f"Error detectado: {e}") 
+        raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
+    
+    finally:
+        if conn:
+            await conn.close()
     
 
 class RequestStatusUpdate(BaseModel):
