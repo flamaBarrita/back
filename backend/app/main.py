@@ -295,7 +295,7 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
             t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available,
             u.name AS driver_name, u.photo_url AS driver_photo, u.rating, u.vehicles AS car
         FROM trips t
-        JOIN users u ON t.driver_id = u.id
+        JOIN drivers u ON t.driver_id = u.id
         WHERE t.status = 'activo' 
           AND t.seats_available > 0
           AND ST_DWithin(t.origin_geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1000)
