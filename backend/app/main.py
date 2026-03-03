@@ -4,6 +4,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi import HTTPException
+from datetime import datetime
 
 app = FastAPI(title="Rides API - Health Check")
 
@@ -20,14 +21,15 @@ class ProfileUpdate(BaseModel):
 
 class TripCreate(BaseModel):
     origin_name: str
+    dest_name: str
+    duration_text: str
+    departure_time: datetime # o str, dependiendo de cómo lo mande Flutter
+    price: float
+    seats_available: int
     origin_lat: float
     origin_lng: float
-    dest_name: str
     dest_lat: float
     dest_lng: float
-    distance_text: str
-    duration_text: str
-
 @app.get("/")
 async def health_check():
     """
@@ -193,46 +195,64 @@ async def create_initial_user(user_id: str, user: UserCreate):
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/trips/{driver_id}")
-async def create_trip(driver_id: str, trip: TripCreate):
+async def create_trip(driver_id: str, trip: TripCreate): # trip es un objeto Pydantic
     conn = None
     try:
-        # 1. Asegúrate de que la URL no tenga el driver '+asyncpg'
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # 2. Query corregida (sin la 'x' intrusa)
-        query = """
-            INSERT INTO trips 
-            (driver_id, origin_name, origin_lat, origin_lng, dest_name, dest_lat, dest_lng, distance_text, duration_text) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-            RETURNING id;
+        # 1. Validación de viaje activo
+        check_query = "SELECT id FROM trips WHERE driver_id = $1 AND status = 'activo';"
+        viaje_activo = await conn.fetchrow(check_query, driver_id)
+        
+        if viaje_activo:
+            # Lanzamos el error directo. El bloque 'finally' se encargará de cerrar la conexión
+            raise HTTPException(
+                status_code=400, 
+                detail="Ya tienes un viaje activo. Debes finalizarlo antes de publicar uno nuevo."
+            )
+
+        # 2. Query de inserción espacial
+        insert_query = """
+            INSERT INTO trips (
+                driver_id, origin_name, dest_name, duration_text, 
+                departure_time, price, seats_available, status,
+                origin_geom, dest_geom
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, 'activo',
+                ST_SetSRID(ST_MakePoint($8, $9), 4326),  -- Longitud, Latitud
+                ST_SetSRID(ST_MakePoint($10, $11), 4326) -- Longitud, Latitud
+            ) RETURNING id;
         """
         
-        # 3. Ejecución
-        new_trip = await conn.fetchrow(
-            query, 
-            driver_id,  # Se envía como string, Postgres lo casteará a varchar(255)
+        # 3. Ejecución usando la notación de punto del modelo Pydantic (trip.campo)
+        nuevo_id = await conn.fetchval(
+            insert_query, 
+            driver_id, 
             trip.origin_name, 
-            trip.origin_lat, 
-            trip.origin_lng,
             trip.dest_name, 
-            trip.dest_lat, 
-            trip.dest_lng,
-            trip.distance_text, 
-            trip.duration_text
+            trip.duration_text, 
+            trip.departure_time, 
+            trip.price, 
+            trip.seats_available,
+            trip.origin_lng, trip.origin_lat,  # Origen: Longitud primero
+            trip.dest_lng, trip.dest_lat       # Destino: Longitud primero
         )
         
-        return {"message": "Viaje publicado con éxito", "trip_id": new_trip["id"]}
+        return {"message": "Viaje publicado con éxito", "trip_id": nuevo_id}
 
+    except HTTPException:
+        # Re-lanzamos la excepción HTTP para que FastAPI la envíe correctamente al frontend
+        raise
     except Exception as e:
-        # Esto te ayudará a ver el error real en la consola de la app
         print(f"Error detectado: {e}") 
         raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
     
     finally:
-        if conn:
+        # Nos aseguramos de cerrar la conexión de forma segura si sigue abierta
+        if conn and not conn.is_closed():
             await conn.close()
-    
 
 class RequestStatusUpdate(BaseModel):
     status: str
@@ -264,3 +284,27 @@ async def update_request_status(request_id: int, update: RequestStatusUpdate):
     await conn.execute(query, update.status, request_id)
     await conn.close()
     return {"message": "Estado actualizado"}
+
+@app.get("/trips/search")
+async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    
+    # ST_DWithin calcula la distancia en metros sobre la esfera terrestre
+    query = """
+        SELECT 
+            t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available,
+            u.name AS driver_name, u.photo_url AS driver_photo, u.rating, u.vehicles AS car
+        FROM trips t
+        JOIN users u ON t.driver_id = u.id
+        WHERE t.status = 'activo' 
+          AND t.seats_available > 0
+          AND ST_DWithin(t.origin_geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1000)
+          AND ST_DWithin(t.dest_geom::geography, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, 1000)
+        ORDER BY t.departure_time ASC;
+    """
+    
+    # Cuidado: En PostGIS el orden es (Longitud, Latitud)
+    resultados = await conn.fetch(query, olng, olat, dlng, dlat)
+    await conn.close()
+    
+    return [dict(r) for r in resultados]
