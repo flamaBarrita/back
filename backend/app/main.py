@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi import HTTPException
 from datetime import datetime
+from typing import Optional
 
 app = FastAPI(title="Rides API - Health Check")
 
@@ -172,6 +173,13 @@ async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA 
 class UserCreate(BaseModel):
     name: str
 
+class TripRequestCreate(BaseModel):
+    passenger_id: str
+    passenger_name: str
+    passenger_photo: Optional[str] = "https://i.pravatar.cc/150"
+    passenger_rating: Optional[str] = "5.0"
+    seats_requested: int
+
 # Este será nuestro "Trigger"
 @app.post("/users/{user_id}")
 async def create_initial_user(user_id: str, user: UserCreate):
@@ -285,6 +293,57 @@ async def update_request_status(request_id: int, update: RequestStatusUpdate):
     await conn.close()
     return {"message": "Estado actualizado"}
 
+
+@app.post("/trips/{trip_id}/requests")
+async def create_trip_request(trip_id: int, req: TripRequestCreate):
+    conn = None
+    try:
+        url_limpia = DATABASE_URL.replace("+asyncpg", "")
+        conn = await asyncpg.connect(url_limpia)
+
+        # 1. Validar que el viaje exista y tenga asientos suficientes
+        trip_query = "SELECT seats_available, status FROM trips WHERE id = $1"
+        trip = await conn.fetchrow(trip_query, trip_id)
+
+        if not trip:
+            raise HTTPException(status_code=404, detail="El viaje no existe")
+        if trip['status'] != 'activo':
+            raise HTTPException(status_code=400, detail="Este viaje ya no está activo")
+        if trip['seats_available'] < req.seats_requested:
+            raise HTTPException(status_code=400, detail="No hay suficientes asientos disponibles")
+
+        # 2. Evitar solicitudes duplicadas del mismo pasajero
+        check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status = 'pendiente'"
+        duplicado = await conn.fetchrow(check_dup, trip_id, req.passenger_id)
+        
+        if duplicado:
+            raise HTTPException(status_code=400, detail="Ya enviaste una solicitud para este viaje")
+
+        # 3. Insertar la solicitud
+        insert_query = """
+            INSERT INTO trip_requests (
+                trip_id, passenger_id, passenger_name, passenger_photo, 
+                passenger_rating, seats_requested, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'pendiente') RETURNING id;
+        """
+        
+        request_id = await conn.fetchval(
+            insert_query, 
+            trip_id, req.passenger_id, req.passenger_name, 
+            req.passenger_photo, req.passenger_rating, req.seats_requested
+        )
+        
+        return {"message": "Solicitud enviada al conductor", "request_id": request_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🔥 ERROR AL SOLICITAR VIAJE: {e}") 
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn and not conn.is_closed():
+            await conn.close()
+
 @app.get("/trips/search")
 async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
@@ -292,8 +351,8 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     # ST_DWithin calcula la distancia en metros sobre la esfera terrestre
     query = """
         SELECT 
-            t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available,
-            u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles
+            t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available, t.distance_text, t.duration_text,
+            u.id AS driver_id, u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles
         FROM trips t
         JOIN drivers u ON t.driver_id = u.id
         WHERE t.status = 'activo' 
