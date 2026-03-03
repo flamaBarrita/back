@@ -5,29 +5,33 @@ services:
   db:
     image: postgis/postgis:15-3.4
     container_name: rides_db
-    restart: always
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: adminflama
-      POSTGRES_PASSWORD: M0v1l--UA01
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
       POSTGRES_DB: rides_db
     volumes:
-      - ./data/pg_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql/data
     networks:
       - rides_network
-    # AJUSTE LOCAL: Configuración estándar (sin consumo excesivo de RAM)
-    # Quitamos el comando de optimización de 60GB. 
-    # Usará los defaults de Postgres (aprox 128MB RAM), perfecto para dev.
-
-    ports:
-      - "5432:5432"
+    # Optimización para tu servidor de 4GB de RAM
+    command: postgres -c shared_buffers=1GB -c effective_cache_size=2GB -c work_mem=16MB
+    # Healthcheck para que el backend no intente conectarse antes de que la BD despierte
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d rides_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # --- CACHÉ (Redis) ---
   redis:
     image: redis:7-alpine
     container_name: rides_redis
-    restart: always
+    restart: unless-stopped
+    # PERSISTENCIA: Obligamos a Redis a guardar en disco cada cambio, no solo en RAM
+    command: redis-server --appendonly yes
     volumes:
-      - ./data/redis_data:/data
+      - redis_data:/data
     networks:
       - rides_network
 
@@ -36,22 +40,26 @@ services:
     build:
       context: ./backend
     container_name: rides_api
-    restart: always
+    restart: unless-stopped
     environment:
-      # En Docker, 'db' es el hostname, no localhost
-      DATABASE_URL: postgresql+asyncpg://adminflama:M0v1l--UA01@db:5432/rides_db
+      DATABASE_URL: postgresql+asyncpg://${DB_USER}:${DB_PASS}@db:5432/rides_db
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy # Espera a que Postgres pase el test de arriba
+      redis:
+        condition: service_started
     networks:
       - rides_network
     ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-    # AJUSTE LOCAL: Habilitamos --reload para que si cambias código, se actualice solo
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - "8000:8000" # Único puerto expuesto a internet
+    # Comando de PRODUCCIÓN: Quitamos el --reload y agregamos workers
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+
+# Volúmenes administrados por Docker (Máxima seguridad y persistencia)
+volumes:
+  pg_data:
+  redis_data:
 
 networks:
   rides_network:
