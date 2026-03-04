@@ -53,7 +53,7 @@ async def health_check():
         version = await conn.fetchval('SELECT version()')
         postgis_version = await conn.fetchval('SELECT PostGIS_version()')
         await conn.close()
-        
+
         status["checks"]["database"] = {
             "status": "OK",
             "version": version,
@@ -121,7 +121,7 @@ async def get_profile(user_id: str):
 
         query = "SELECT name, biography, preferences, vehicles FROM drivers WHERE id = $1"
         row = await conn.fetchrow(query, user_id)
-        
+
         await conn.close()
 
         # Si el usuario existe, devolvemos sus datos. Si no, devolvemos campos vacíos.
@@ -143,21 +143,21 @@ async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA 
         query = """
             INSERT INTO drivers (id, name, biography, preferences, vehicles)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO UPDATE 
-            SET biography = EXCLUDED.biography, 
-                preferences = EXCLUDED.preferences, 
+            ON CONFLICT (id) DO UPDATE
+            SET biography = EXCLUDED.biography,
+                preferences = EXCLUDED.preferences,
                 vehicles = EXCLUDED.vehicles
             RETURNING id;
         """
-        
+
         # Como no sabemos el nombre al crear el perfil, pasamos "Usuario Cognito" por defecto
         # (Idealmente luego sacarás el nombre real desde Flutter o Cognito)
         updated_row = await conn.fetchrow(
-            query, 
-            user_id, 
-            "Usuario Cognito", 
-            profile.biography, 
-            profile.preferences, 
+            query,
+            user_id,
+            "Usuario Cognito",
+            profile.biography,
+            profile.preferences,
             profile.vehicles
         )
 
@@ -168,7 +168,7 @@ async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA 
     except Exception as e:
         # AQUÍ ESTÁ LA MAGIA: Esto sí lanza un error 500 real hacia Flutter
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 
 class UserCreate(BaseModel):
     name: str
@@ -190,8 +190,8 @@ async def create_initial_user(user_id: str, user: UserCreate):
         # Insertamos el usuario con su ID de Cognito y su nombre real.
         # Si por alguna razón ya existe (ON CONFLICT), no hacemos nada (DO NOTHING).
         query = """
-            INSERT INTO drivers (id, name) 
-            VALUES ($1, $2) 
+            INSERT INTO drivers (id, name)
+            VALUES ($1, $2)
             ON CONFLICT (id) DO NOTHING;
         """
         await conn.execute(query, user_id, user.name)
@@ -201,7 +201,7 @@ async def create_initial_user(user_id: str, user: UserCreate):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.post("/trips/{driver_id}")
 async def create_trip(driver_id: str, trip: TripCreate): # trip es un objeto Pydantic
     conn = None
@@ -212,18 +212,18 @@ async def create_trip(driver_id: str, trip: TripCreate): # trip es un objeto Pyd
         # 1. Validación de viaje activo
         check_query = "SELECT id FROM trips WHERE driver_id = $1 AND status = 'activo';"
         viaje_activo = await conn.fetchrow(check_query, driver_id)
-        
+
         if viaje_activo:
             # Lanzamos el error directo. El bloque 'finally' se encargará de cerrar la conexión
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Ya tienes un viaje activo. Debes finalizarlo antes de publicar uno nuevo."
             )
 
         # 2. Query de inserción espacial
         insert_query = """
             INSERT INTO trips (
-                driver_id, origin_name, dest_name, duration_text, 
+                driver_id, origin_name, dest_name, duration_text,
                 departure_time, price, seats_available, status,
                 origin_geom, dest_geom
             )
@@ -233,30 +233,30 @@ async def create_trip(driver_id: str, trip: TripCreate): # trip es un objeto Pyd
                 ST_SetSRID(ST_MakePoint($10, $11), 4326) -- Longitud, Latitud
             ) RETURNING id;
         """
-        
+
         # 3. Ejecución usando la notación de punto del modelo Pydantic (trip.campo)
         nuevo_id = await conn.fetchval(
-            insert_query, 
-            driver_id, 
-            trip.origin_name, 
-            trip.dest_name, 
-            trip.duration_text, 
-            trip.departure_time, 
-            trip.price, 
+            insert_query,
+            driver_id,
+            trip.origin_name,
+            trip.dest_name,
+            trip.duration_text,
+            trip.departure_time,
+            trip.price,
             trip.seats_available,
             trip.origin_lng, trip.origin_lat,  # Origen: Longitud primero
             trip.dest_lng, trip.dest_lat       # Destino: Longitud primero
         )
-        
+
         return {"message": "Viaje publicado con éxito", "trip_id": nuevo_id}
 
     except HTTPException:
         # Re-lanzamos la excepción HTTP para que FastAPI la envíe correctamente al frontend
         raise
     except Exception as e:
-        print(f"Error detectado: {e}") 
+        print(f"Error detectado: {e}")
         raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
-    
+
     finally:
         # Nos aseguramos de cerrar la conexión de forma segura si sigue abierta
         if conn and not conn.is_closed():
@@ -278,11 +278,29 @@ async def get_active_trip(driver_id: str):
 # 2. Obtener las solicitudes de ese viaje
 @app.get("/trips/{trip_id}/requests")
 async def get_trip_requests(trip_id: int):
-    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
-    query = "SELECT * FROM trip_requests WHERE trip_id = $1 AND status = 'pendiente';"
-    requests = await conn.fetch(query, trip_id)
-    await conn.close()
-    return [dict(r) for r in requests]
+    conn = None
+    try:
+        url_limpia = DATABASE_URL.replace("+asyncpg", "")
+        conn = await asyncpg.connect(url_limpia)
+
+        # Traemos todas las solicitudes pendientes para este viaje
+        query = """
+            SELECT id, trip_id, passenger_id, passenger_name, passenger_photo,
+                   passenger_rating, seats_requested, status
+            FROM trip_requests
+            WHERE trip_id = $1 AND status = 'pendiente'
+            ORDER BY id ASC;
+        """
+
+        resultados = await conn.fetch(query, trip_id)
+        return [dict(r) for r in resultados]
+
+    except Exception as e:
+        print(f"Error obteniendo peticiones: {e}")
+        raise HTTPException(status_code=500, detail="Error al obtener peticiones")
+    finally:
+        if conn and not conn.is_closed():
+            await conn.close()
 
 # 3. Aceptar o rechazar una solicitud
 @app.put("/requests/{request_id}/status")
@@ -315,30 +333,30 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
         # 2. Evitar solicitudes duplicadas del mismo pasajero
         check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status = 'pendiente'"
         duplicado = await conn.fetchrow(check_dup, trip_id, req.passenger_id)
-        
+
         if duplicado:
             raise HTTPException(status_code=400, detail="Ya enviaste una solicitud para este viaje")
 
         # 3. Insertar la solicitud
         insert_query = """
             INSERT INTO trip_requests (
-                trip_id, passenger_id, passenger_name, passenger_photo, 
+                trip_id, passenger_id, passenger_name, passenger_photo,
                 passenger_rating, seats_requested, status
             ) VALUES ($1, $2, $3, $4, $5, $6, 'pendiente') RETURNING id;
         """
-        
+
         request_id = await conn.fetchval(
-            insert_query, 
-            trip_id, req.passenger_id, req.passenger_name, 
+            insert_query,
+            trip_id, req.passenger_id, req.passenger_name,
             req.passenger_photo, req.passenger_rating, req.seats_requested
         )
-        
+
         return {"message": "Solicitud enviada al conductor", "request_id": request_id}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔥 ERROR AL SOLICITAR VIAJE: {e}") 
+        print(f"🔥 ERROR AL SOLICITAR VIAJE: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn and not conn.is_closed():
@@ -347,23 +365,23 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
 @app.get("/trips/search")
 async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
-    
+
     # ST_DWithin calcula la distancia en metros sobre la esfera terrestre
     query = """
-        SELECT 
+        SELECT
             t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available, t.distance_text, t.duration_text,
             u.id AS driver_id, u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles
         FROM trips t
         JOIN drivers u ON t.driver_id = u.id
-        WHERE t.status = 'activo' 
+        WHERE t.status = 'activo'
           AND t.seats_available > 0
           AND ST_DWithin(t.origin_geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1000)
           AND ST_DWithin(t.dest_geom::geography, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, 1000)
         ORDER BY t.departure_time ASC;
     """
-    
+
     # Cuidado: En PostGIS el orden es (Longitud, Latitud)
     resultados = await conn.fetch(query, olng, olat, dlng, dlat)
     await conn.close()
-    
+
     return [dict(r) for r in resultados]
