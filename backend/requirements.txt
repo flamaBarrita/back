@@ -6,3 +6,5 @@ geoalchemy2
 psycopg2-binary
 pydantic-settings
 redis
+PyJWT==2.8.0
+cryptography==42.0.5
