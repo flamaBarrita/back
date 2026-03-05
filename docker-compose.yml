@@ -44,6 +44,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${DB_USER}:${DB_PASS}@db:5432/rides_db
       REDIS_URL: redis://redis:6379/0
+      COGNITO_REGION: ${COGNITO_REGION}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID}
     depends_on:
       db:
         condition: service_healthy # Espera a que Postgres pase el test de arriba
