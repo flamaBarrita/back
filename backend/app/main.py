@@ -3,15 +3,74 @@ import asyncpg
 import redis.asyncio as redis
 from fastapi import FastAPI
 from pydantic import BaseModel
-from fastapi import HTTPException
-from datetime import datetime
+from datetime import datetime,timedelta
 from typing import Optional
+import jwt
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends
 
 app = FastAPI(title="Rides API - Health Check")
 
 # Obtenemos las URLs de las variables de entorno definidas en docker-compose.yml
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
+COGNITO_REGION = os.getenv("COGNITO_REGION")
+COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID")
+
+##seguridad de endpoints
+
+JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+
+
+if not COGNITO_REGION or not COGNITO_USER_POOL_ID:
+    raise ValueError("🔥 ERROR CRÍTICO: Faltan las variables COGNITO_REGION o COGNITO_USER_POOL_ID en tu docker-compose.yml")
+
+# Construimos la URL dinámica
+JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+
+print(f"✅ Conectando seguridad a Cognito en: {JWKS_URL}") # Esto te confi
+# El cliente que descarga y guarda las llaves en caché para no hacer peticiones lentas cada vez
+jwks_client = PyJWKClient(JWKS_URL)
+security = HTTPBearer()
+
+
+async def obtener_usuario_actual(credenciales: HTTPAuthorizationCredentials = Depends(security)):
+    """Verifica que el token JWT haya sido firmado realmente por tu AWS Cognito"""
+    token = credenciales.credentials
+    try:
+        # 1. Buscamos la llave pública correcta de Cognito para este token específico
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        
+        # 2. Decodificamos y validamos matemáticamente el token
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"], # Cognito siempre usa RS256
+            issuer=f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}",
+            options={"verify_aud": False}
+        )
+        
+        # En Cognito, el ID único e inmutable del usuario viene en la variable 'sub'
+        cognito_user_id = payload.get("sub")
+        if not cognito_user_id:
+            raise HTTPException(status_code=401, detail="Token inválido: sin identificador")
+            
+        return cognito_user_id
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Tu sesión expiró. Vuelve a iniciar sesión en la rutas_protegidas.")
+    except Exception as e:
+        print(f"🔥 Intento de acceso denegado (Token inválido): {e}")
+        raise HTTPException(status_code=401, detail="Acceso no autorizado.")
+    
+
+rutas_protegidas = APIRouter(dependencies=[Depends(obtener_usuario_actual)])
+####
+
+
+
 
 # 1. Creamos el modelo de datos esperado desde Flutter
 class ProfileUpdate(BaseModel):
@@ -86,8 +145,9 @@ async def health_check():
 
     return status
 
-@app.get("/drivers")
+@rutas_protegidas.get("/drivers")
 async def get_drivers():
+
     """
     Consulta la tabla 'drivers' que creamos manualmente.
     """
@@ -109,11 +169,12 @@ async def get_drivers():
 
         await conn.close()
         return results
-
+    
     except Exception as e:
         return {"error": str(e)}
+    
 
-@app.get("/profile/{user_id}")
+@rutas_protegidas.get("/profile/{user_id}")
 async def get_profile(user_id: str):
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
@@ -133,7 +194,7 @@ async def get_profile(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/profile/{user_id}")
+@rutas_protegidas.put("/profile/{user_id}")
 async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA ES str
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
@@ -181,7 +242,7 @@ class TripRequestCreate(BaseModel):
     seats_requested: int
 
 # Este será nuestro "Trigger"
-@app.post("/users/{user_id}")
+@rutas_protegidas.post("/users/{user_id}")
 async def create_initial_user(user_id: str, user: UserCreate):
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
@@ -202,8 +263,8 @@ async def create_initial_user(user_id: str, user: UserCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/trips/{driver_id}")
-async def create_trip(driver_id: str, trip: TripCreate): # trip es un objeto Pydantic
+@rutas_protegidas.post("/trips/{driver_id}")
+async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuario_actual)): # trip es un objeto Pydantic
     conn = None
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
@@ -266,7 +327,7 @@ class RequestStatusUpdate(BaseModel):
     status: str
 
 # 1. Obtener el viaje activo del conductor
-@app.get("/trips/active/{driver_id}")
+@rutas_protegidas.get("/trips/active/{driver_id}")
 async def get_active_trip(driver_id: str):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     # Buscamos el último viaje del conductor (puedes ajustar la lógica después)
@@ -276,7 +337,7 @@ async def get_active_trip(driver_id: str):
     return dict(trip) if trip else None
 
 # 2. Obtener las solicitudes de ese viaje
-@app.get("/trips/{trip_id}/requests")
+@rutas_protegidas.get("/trips/{trip_id}/requests")
 async def get_trip_requests(trip_id: int):
     conn = None
     try:
@@ -303,7 +364,7 @@ async def get_trip_requests(trip_id: int):
             await conn.close()
 
 # 3. Aceptar o rechazar una solicitud
-@app.put("/requests/{request_id}/status")
+@rutas_protegidas.put("/requests/{request_id}/status")
 async def update_request_status(request_id: int, update: RequestStatusUpdate):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     query = "UPDATE trip_requests SET status = $1 WHERE id = $2;"
@@ -312,7 +373,7 @@ async def update_request_status(request_id: int, update: RequestStatusUpdate):
     return {"message": "Estado actualizado"}
 
 
-@app.post("/trips/{trip_id}/requests")
+@rutas_protegidas.post("/trips/{trip_id}/requests")
 async def create_trip_request(trip_id: int, req: TripRequestCreate):
     conn = None
     try:
@@ -362,7 +423,7 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
         if conn and not conn.is_closed():
             await conn.close()
 
-@app.get("/trips/search")
+@rutas_protegidas.get("/trips/search")
 async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
 
@@ -385,3 +446,6 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     await conn.close()
 
     return [dict(r) for r in resultados]
+
+
+app.include_router(rutas_protegidas)
