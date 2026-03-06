@@ -21,17 +21,9 @@ COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID")
 
 ##seguridad de endpoints
 
-JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
-
-
-if not COGNITO_REGION or not COGNITO_USER_POOL_ID:
-    raise ValueError("🔥 ERROR CRÍTICO: Faltan las variables COGNITO_REGION o COGNITO_USER_POOL_ID en tu docker-compose.yml")
-
 # Construimos la URL dinámica
 JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
 
-print(f"✅ Conectando seguridad a Cognito en: {JWKS_URL}") # Esto te confi
-# El cliente que descarga y guarda las llaves en caché para no hacer peticiones lentas cada vez
 jwks_client = PyJWKClient(JWKS_URL)
 security = HTTPBearer()
 
@@ -331,7 +323,7 @@ class RequestStatusUpdate(BaseModel):
 async def get_active_trip(driver_id: str):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     # Buscamos el último viaje del conductor (puedes ajustar la lógica después)
-    query = "SELECT * FROM trips WHERE driver_id = $1 ORDER BY id DESC LIMIT 1;"
+    query = "SELECT * FROM trips WHERE driver_id = $1 and status = 'activo' ORDER BY id DESC LIMIT 1;"
     trip = await conn.fetchrow(query, driver_id)
     await conn.close()
     return dict(trip) if trip else None
@@ -447,5 +439,31 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
 
     return [dict(r) for r in resultados]
 
+@rutas_protegidas.patch("/trips/{trip_id}/cancelar")
+async def delete_trip(trip_id: int):
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    
+    try:
+       
+        query = "UPDATE trips SET status = 'cancelado' WHERE id = $1;"
+        
+        resultado = await conn.execute(query, trip_id)
+        
+        # Verificamos si realmente se afectó alguna fila
+        if resultado == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Viaje no encontrado o ya eliminado")
+            
+        return {"message": "Viaje eliminado exitosamente", "exito": True}
+        
+    except Exception as e:
+        print(f"Error al eliminar viaje: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+        
+    finally:
+        # SIEMPRE cerrar la conexión, incluso si el código falla
+        await conn.close()
+
 
 app.include_router(rutas_protegidas)
+
+
