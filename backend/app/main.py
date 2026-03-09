@@ -232,6 +232,7 @@ class TripRequestCreate(BaseModel):
     passenger_photo: Optional[str] = "https://i.pravatar.cc/150"
     passenger_rating: Optional[str] = "5.0"
     seats_requested: int
+    sender_id: str
 
 # Este será nuestro "Trigger"
 @rutas_protegidas.post("/users/{user_id}")
@@ -387,6 +388,12 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
         check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status = 'pendiente'"
         duplicado = await conn.fetchrow(check_dup, trip_id, req.passenger_id)
 
+        selfrequest = "select id from trip_requests where (select driver_id from trips where id = $1) <> $2;" #
+        selftrip = await conn.fetchrow(selfrequest, trip_id, req.sender_id)
+
+        if not selftrip:
+            raise HTTPException(status_code=400, detail="No puedes solicitar tu propio viaje")
+
         if duplicado:
             raise HTTPException(status_code=400, detail="Ya enviaste una solicitud para este viaje")
 
@@ -404,7 +411,7 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
             req.passenger_photo, req.passenger_rating, req.seats_requested
         )
 
-        return {"message": "Solicitud enviada al conductor", "request_id": request_id}
+        return {"message": "Solicitud enviada al conductor AAAHHH", "request_id": request_id}
 
     except HTTPException:
         raise
@@ -446,12 +453,15 @@ async def delete_trip(trip_id: int):
     try:
        
         query = "UPDATE trips SET status = 'cancelado' WHERE id = $1;"
+        quey_delete_requests = "UPDATE trip_requests SET status = 'cancelado' WHERE trip_id = $1;"
         
         resultado = await conn.execute(query, trip_id)
         
         # Verificamos si realmente se afectó alguna fila
         if resultado == "UPDATE 0":
             raise HTTPException(status_code=404, detail="Viaje no encontrado o ya eliminado")
+        
+        await conn.execute(quey_delete_requests, trip_id)
             
         return {"message": "Viaje eliminado exitosamente", "exito": True}
         
@@ -463,6 +473,66 @@ async def delete_trip(trip_id: int):
         # SIEMPRE cerrar la conexión, incluso si el código falla
         await conn.close()
 
+@rutas_protegidas.get("/mis-viajes/aprobados/{passenger_id}")
+async def get_viajes_aprobados(passenger_id: str):
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    try:
+        # Hacemos un JOIN entre trips y trip_requests. 
+        # Adaptalo a los nombres exactos de tus columnas.
+        query = """
+            SELECT 
+                t.*, 
+                tr.status as request_status,
+                u.name as driver_name,
+                u.biography as driver_biography,
+                u.vehicles as driver_vehicles,
+                u.preferences as driver_preferences
+            FROM trips t
+            INNER JOIN trip_requests tr ON t.id = tr.trip_id
+            INNER JOIN drivers u ON t.driver_id = u.id
+            WHERE tr.passenger_id = $1 
+            AND tr.status = 'aceptado'
+            AND t.status != 'cancelled'
+            ORDER BY t.departure_time ASC;
+        """
+        viajes = await conn.fetch(query, passenger_id)
+        
+        # Convertimos los registros a una lista de diccionarios para mandar el JSON
+        return [dict(viaje) for viaje in viajes]
+    except Exception as e:
+        print(f"Error al obtener viajes aprobados: {e}")
+        raise HTTPException(status_code=500, detail="Error al consultar la base de datos")
+    finally:
+        await conn.close()
+
+
+@rutas_protegidas.patch("/trips/{trip_id}/pasajeros/{passenger_id}/cancelar")
+async def cancelar_asiento_pasajero(trip_id: int, passenger_id: str):
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    try:
+        # 1. Actualizamos el estatus en la tabla de solicitudes a "cancelado por pasajero"
+        # Usamos Soft Delete para mantener el registro de que alguna vez estuvo ahí
+        query_update = """
+            UPDATE trip_requests 
+            SET status = 'cancelled_by_passen' 
+            WHERE trip_id = $1 AND passenger_id = $2 AND status = 'aceptado';
+        """
+        resultado = await conn.execute(query_update, trip_id, passenger_id)
+        
+        if resultado == "UPDATE 0":
+            raise HTTPException(status_code=400, detail="No se encontró una reserva activa para cancelar")
+
+        # 2. (Opcional pero recomendado) Sumarle +1 a los asientos disponibles en la tabla trips
+        # query_seats = "UPDATE trips SET seats_available = seats_available + 1 WHERE id = $1;"
+        # await conn.execute(query_seats, trip_id)
+
+        return {"message": "Asiento cancelado con éxito", "success": True}
+        
+    except Exception as e:
+        print(f"Error cancelando asiento: {e}")
+        raise HTTPException(status_code=500, detail="Error al cancelar")
+    finally:
+        await conn.close()
 
 app.include_router(rutas_protegidas)
 
