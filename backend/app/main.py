@@ -10,6 +10,7 @@ from jwt import PyJWKClient
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import APIRouter, Depends
+import polyline 
 
 app = FastAPI(title="Rides API - Health Check")
 
@@ -82,6 +83,7 @@ class TripCreate(BaseModel):
     origin_lng: float
     dest_lat: float
     dest_lng: float
+    encoded_polyline: str
 @app.get("/")
 async def health_check():
     """
@@ -257,38 +259,52 @@ async def create_initial_user(user_id: str, user: UserCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @rutas_protegidas.post("/trips/{driver_id}")
-async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuario_actual)): # trip es un objeto Pydantic
+async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuario_actual)): 
     conn = None
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # 1. Validación de viaje activo
+        # 1. Validación de viaje activo 
         check_query = "SELECT id FROM trips WHERE driver_id = $1 AND status = 'activo';"
         viaje_activo = await conn.fetchrow(check_query, driver_id)
 
         if viaje_activo:
-            # Lanzamos el error directo. El bloque 'finally' se encargará de cerrar la conexión
             raise HTTPException(
                 status_code=400,
                 detail="Ya tienes un viaje activo. Debes finalizarlo antes de publicar uno nuevo."
             )
 
-        # 2. Query de inserción espacial
+        # 2. Decodificación de la polyline y conversión a WKT para PostGIS
+        try:
+            # polyline.decode devuelve una lista de tuplas (latitud, longitud)
+            coords = polyline.decode(trip.encoded_polyline)
+            
+            # PostGIS necesita LONGITUD primero y LATITUD después.
+            # Convertimos la lista en un string: "lon1 lat1, lon2 lat2, lon3 lat3..."
+            linestring_coords = ", ".join([f"{lon} {lat}" for lat, lon in coords])
+            
+            # Armamos el formato WKT final
+            route_wkt = f"LINESTRING({linestring_coords})"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="La polyline proporcionada no es válida.")
+
+        # 3. Query de inserción espacial actualizada con route_geom
         insert_query = """
             INSERT INTO trips (
                 driver_id, origin_name, dest_name, duration_text,
                 departure_time, price, seats_available, status,
-                origin_geom, dest_geom
+                origin_geom, dest_geom, route_geom
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, 'activo',
-                ST_SetSRID(ST_MakePoint($8, $9), 4326),  -- Longitud, Latitud
-                ST_SetSRID(ST_MakePoint($10, $11), 4326) -- Longitud, Latitud
+                ST_SetSRID(ST_MakePoint($8, $9), 4326),  -- Origen: Longitud, Latitud
+                ST_SetSRID(ST_MakePoint($10, $11), 4326), -- Destino: Longitud, Latitud
+                ST_GeomFromText($12, 4326)               -- ⚡ Ruta Completa: LINESTRING
             ) RETURNING id;
         """
 
-        # 3. Ejecución usando la notación de punto del modelo Pydantic (trip.campo)
+        # 4. Ejecución (Añadimos route_wkt como el parámetro $12)
         nuevo_id = await conn.fetchval(
             insert_query,
             driver_id,
@@ -298,21 +314,20 @@ async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuari
             trip.departure_time,
             trip.price,
             trip.seats_available,
-            trip.origin_lng, trip.origin_lat,  # Origen: Longitud primero
-            trip.dest_lng, trip.dest_lat       # Destino: Longitud primero
+            trip.origin_lng, trip.origin_lat,  
+            trip.dest_lng, trip.dest_lat,      
+            route_wkt # ⚡ Mandamos el string decodificado a Postgres
         )
 
         return {"message": "Viaje publicado con éxito", "trip_id": nuevo_id}
 
     except HTTPException:
-        # Re-lanzamos la excepción HTTP para que FastAPI la envíe correctamente al frontend
         raise
     except Exception as e:
         print(f"Error detectado: {e}")
         raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
 
     finally:
-        # Nos aseguramos de cerrar la conexión de forma segura si sigue abierta
         if conn and not conn.is_closed():
             await conn.close()
 
