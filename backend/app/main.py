@@ -11,8 +11,16 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import APIRouter, Depends
 import polyline 
+import firebase_admin
+from firebase_admin import credentials, messaging
 
-app = FastAPI(title="Rides API - Health Check")
+cred = credentials.Certificate("firebase.json") 
+firebase_admin.initialize_app(cred)
+
+app = FastAPI(
+    docs_url="/mario_docs-production_secure",
+    redoc_url=None,
+    title="Rides API - Health Check")
 
 # Obtenemos las URLs de las variables de entorno definidas en docker-compose.yml
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -62,7 +70,23 @@ async def obtener_usuario_actual(credenciales: HTTPAuthorizationCredentials = De
 rutas_protegidas = APIRouter(dependencies=[Depends(obtener_usuario_actual)])
 ####
 
-
+def enviar_notificacion_push(fcm_token: str, titulo: str, cuerpo: str):
+    try:
+        # Armamos el mensaje
+        mensaje = messaging.Message(
+            notification=messaging.Notification(
+                title=titulo,
+                body=cuerpo,
+            ),
+            token=fcm_token, # Aquí va el token que sacaremos de Postgres
+        )
+        # Lo disparamos a través de los servidores de Google
+        respuesta = messaging.send(mensaje)
+        print(f"Notificación enviada con éxito: {respuesta}")
+        return True
+    except Exception as e:
+        print(f"Error al enviar notificación FCM: {e}")
+        return False
 
 
 # 1. Creamos el modelo de datos esperado desde Flutter
@@ -373,12 +397,50 @@ async def get_trip_requests(trip_id: int):
 
 # 3. Aceptar o rechazar una solicitud
 @rutas_protegidas.put("/requests/{request_id}/status")
-async def update_request_status(request_id: int, update: RequestStatusUpdate):
+async def update_request_status(
+    request_id: int, 
+    update: RequestStatusUpdate,
+    background_tasks: BackgroundTasks  #tareas en 2do plano
+):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
-    query = "UPDATE trip_requests SET status = $1 WHERE id = $2;"
-    await conn.execute(query, update.status, request_id)
-    await conn.close()
-    return {"message": "Estado actualizado"}
+    
+    try:
+        # 1. Actualizamos el estado y usamos RETURNING para sacar el ID del pasajero de inmediato
+        query_update = """
+            UPDATE trip_requests 
+            SET status = $1 
+            WHERE id = $2 
+            RETURNING passenger_id;
+        """
+        passenger_id = await conn.fetchval(query_update, update.status, request_id)
+
+        if not passenger_id:
+            raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+
+        # hacemos una query para pedir el token FMC
+        query_token = "SELECT fcm_token FROM drivers WHERE id = $1;"
+        fcm_token = await conn.fetchval(query_token, passenger_id)
+
+        # Preparamos el mensaje dependiendo de la decisión del conductor
+        if fcm_token:
+            titulo = ""
+            cuerpo = ""
+            
+            if update.status == "aceptado":
+                titulo = "¡Lugar Asegurado! 🚗✅"
+                cuerpo = "El conductor ha aceptado tu solicitud. ¡Prepárate para el viaje!"
+            elif update.status == "rechazado":
+                titulo = "Viaje lleno 😔"
+                cuerpo = "El conductor no pudo aceptar tu solicitud esta vez."
+                
+            # Disparamos la notificación en segundo plano
+            if titulo:
+                background_tasks.add_task(enviar_notificacion_push, fcm_token, titulo, cuerpo)
+
+        return {"message": "Estado actualizado exitosamente"}
+        
+    finally:
+        await conn.close()
 
 
 @rutas_protegidas.post("/trips/{trip_id}/requests")
@@ -546,6 +608,25 @@ async def cancelar_asiento_pasajero(trip_id: int, passenger_id: str):
     except Exception as e:
         print(f"Error cancelando asiento: {e}")
         raise HTTPException(status_code=500, detail="Error al cancelar")
+    finally:
+        await conn.close()
+
+class FCMTokenUpdate(BaseModel):
+    fcm_token: str
+
+@rutas_protegidas.patch("/api/users/update-fcm-token")
+async def update_fcm_token(
+    data: FCMTokenUpdate, 
+    user_id: str = Depends(obtener_usuario_actual)
+):
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    try:
+        query = "UPDATE drivers SET fcm_token = $1 WHERE id = $2;"
+        await conn.execute(query, data.fcm_token, user_id)
+        return {"success": True, "message": "Token de notificaciones actualizado"}
+    except Exception as e:
+        print(f"Error actualizando FCM token: {e}")
+        raise HTTPException(status_code=500, detail="Error interno")
     finally:
         await conn.close()
 
