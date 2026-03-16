@@ -1,3 +1,4 @@
 #ignorar variables
 .env
-/home/flama/Documents/back_blabla/firebase.json
+/home/flama/Documents/back_blabla/backend/app/firebase.json
+backend/app/firebase.json

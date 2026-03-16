@@ -1,7 +1,7 @@
 import os
 import asyncpg
 import redis.asyncio as redis
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from datetime import datetime,timedelta
 from typing import Optional
@@ -14,7 +14,13 @@ import polyline
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-cred = credentials.Certificate("firebase.json") 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+firebase_path = os.path.join(current_dir, "firebase.json")
+
+# Pasa la ruta absoluta a Firebase
+cred = credentials.Certificate(firebase_path)
+
 firebase_admin.initialize_app(cred)
 
 app = FastAPI(
