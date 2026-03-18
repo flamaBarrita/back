@@ -44,22 +44,25 @@ security = HTTPBearer()
 
 
 async def obtener_usuario_actual(credenciales: HTTPAuthorizationCredentials = Depends(security)):
-    """Verifica que el token JWT haya sido firmado realmente por tu AWS Cognito"""
+    """
+    Valida que el token JWT sea legítimo y firmado por AWS Cognito.
+    
+    Extrae la clave pública de Cognito, decodifica el token y verifica su validez.
+    Si el token es válido, retorna el ID único del usuario (sub claim).
+    Si falla, lanza excepciones HTTP con estado 401.
+    """
     token = credenciales.credentials
     try:
-        # 1. Buscamos la llave pública correcta de Cognito para este token específico
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         
-        # 2. Decodificamos y validamos matemáticamente el token
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["RS256"], # Cognito siempre usa RS256
+            algorithms=["RS256"],
             issuer=f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}",
             options={"verify_aud": False}
         )
         
-        # En Cognito, el ID único e inmutable del usuario viene en la variable 'sub'
         cognito_user_id = payload.get("sub")
         if not cognito_user_id:
             raise HTTPException(status_code=401, detail="Token inválido: sin identificador")
@@ -67,35 +70,39 @@ async def obtener_usuario_actual(credenciales: HTTPAuthorizationCredentials = De
         return cognito_user_id
 
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Tu sesión expiró. Vuelve a iniciar sesión en la rutas_protegidas.")
+        raise HTTPException(status_code=401, detail="Tu sesión expiró. Vuelve a iniciar sesión.")
     except Exception as e:
-        print(f"🔥 Intento de acceso denegado (Token inválido): {e}")
+        print(f"Intento de acceso denegado (Token inválido): {e}")
         raise HTTPException(status_code=401, detail="Acceso no autorizado.")
     
-
+# Creamos un alias para evitar sobreescribir 
 rutas_protegidas = APIRouter(dependencies=[Depends(obtener_usuario_actual)])
 ####
 
 def enviar_notificacion_push(fcm_token: str, titulo: str, cuerpo: str):
+    """
+    Envía una notificación push a un dispositivo usando Firebase Cloud Messaging.
+    
+    Construye un mensaje con título y cuerpo, y lo envía al token FCM del usuario.
+    Retorna True si se envía correctamente, False si hay error.
+    """
     try:
-        # Armamos el mensaje
         mensaje = messaging.Message(
             notification=messaging.Notification(
                 title=titulo,
                 body=cuerpo,
             ),
-            token=fcm_token, # Aquí va el token que sacaremos de Postgres
+            token=fcm_token,
         )
-        # Lo disparamos a través de los servidores de Google
         respuesta = messaging.send(mensaje)
-        print(f"Notificación enviada con éxito: {respuesta}")
+        print(f"Notificación enviada exitosamente: {respuesta}")
         return True
     except Exception as e:
         print(f"Error al enviar notificación FCM: {e}")
         return False
 
 
-# 1. Creamos el modelo de datos esperado desde Flutter
+# Creamos el modelo de datos esperado desde Flutter
 class ProfileUpdate(BaseModel):
     biography: str | None = None
     preferences: str | None = None
@@ -106,7 +113,7 @@ class TripCreate(BaseModel):
     origin_name: str
     dest_name: str
     duration_text: str
-    departure_time: datetime # o str, dependiendo de cómo lo mande Flutter
+    departure_time: datetime 
     price: float
     seats_available: int
     origin_lat: float
@@ -117,7 +124,11 @@ class TripCreate(BaseModel):
 @app.get("/")
 async def health_check():
     """
-    Ruta de diagnóstico para verificar conectividad con DB y Redis.
+    Verifica el estado de conexión del servidor con PostgreSQL y Redis.
+    
+    Se conecta a la base de datos para consultar versión y soporte de PostGIS,
+    luego se conecta a Redis para verificar disponibilidad.
+    Retorna un diccionario con el estado de cada servicio.
     """
     status = {
         "service": "Rides API Backend",
@@ -125,14 +136,9 @@ async def health_check():
         "checks": {}
     }
 
-    # 1. PRUEBA DE BASE DE DATOS (PostgreSQL/PostGIS)
-
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
-
-        # Conexión directa con asyncpg para probar la red
         conn = await asyncpg.connect(url_limpia)
-        # Consultamos la versión y si PostGIS está instalado
         version = await conn.fetchval('SELECT version()')
         postgis_version = await conn.fetchval('SELECT PostGIS_version()')
         await conn.close()
@@ -148,11 +154,8 @@ async def health_check():
             "detail": str(e)
         }
 
-    # 2. PRUEBA DE CACHÉ (Redis)
     try:
-        # Conexión a Redis
         r = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-        # Escribimos y leemos un valor de prueba
         await r.set("health_check", "Redis is alive!")
         val = await r.get("health_check")
         await r.close()
@@ -171,60 +174,57 @@ async def health_check():
 
 @rutas_protegidas.get("/drivers")
 async def get_drivers():
-
     """
-    Consulta la tabla 'drivers' que creamos manualmente.
+    Obtiene la lista de todos los conductores con su ID, nombre y estado.
+    
+    Consulta la tabla drivers y retorna los datos básicos de cada conductor.
     """
     results = []
     try:
-        # 1. Limpiamos la URL igual que antes
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
-
-        # 2. Conectamos
         conn = await asyncpg.connect(url_limpia)
-
-        # 3. Ejecutamos la consulta SQL directa
-        # fetch: trae todas las filas
         rows = await conn.fetch("SELECT id, name, status FROM drivers")
-
-        # 4. Convertimos los resultados (que son objetos Record) a Diccionarios
         for row in rows:
             results.append(dict(row))
-
         await conn.close()
         return results
-    
     except Exception as e:
         return {"error": str(e)}
     
 
 @rutas_protegidas.get("/profile/{user_id}")
 async def get_profile(user_id: str):
+    """
+    Obtiene el perfil de un usuario, incluyendo biografía, preferencias y vehículos.
+    
+    Si el usuario existe, retorna sus datos. Si no existe, retorna campos vacíos.
+    """
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
-
         query = "SELECT name, biography, preferences, vehicles FROM drivers WHERE id = $1"
         row = await conn.fetchrow(query, user_id)
-
         await conn.close()
 
-        # Si el usuario existe, devolvemos sus datos. Si no, devolvemos campos vacíos.
         if row:
             return dict(row)
         else:
             return {"biography": "", "preferences": "", "vehicles": ""}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @rutas_protegidas.put("/profile/{user_id}")
-async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA ES str
+async def update_profile(user_id: str, profile: ProfileUpdate):
+    """
+    Actualiza o crea el perfil de un usuario con sus datos personales.
+    
+    Usa un UPSERT de SQL: si el usuario existe, actualiza sus datos;
+    si no existe, lo crea. Guarda biografía, preferencias y vehículos.
+    """
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # LÓGICA UPSERT: Inserta o Actualiza en la misma consulta
         query = """
             INSERT INTO drivers (id, name, biography, preferences, vehicles)
             VALUES ($1, $2, $3, $4, $5)
@@ -235,8 +235,6 @@ async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA 
             RETURNING id;
         """
 
-        # Como no sabemos el nombre al crear el perfil, pasamos "Usuario Cognito" por defecto
-        # (Idealmente luego sacarás el nombre real desde Flutter o Cognito)
         updated_row = await conn.fetchrow(
             query,
             user_id,
@@ -247,11 +245,8 @@ async def update_profile(user_id: str, profile: ProfileUpdate): # user_id AHORA 
         )
 
         await conn.close()
-
         return {"message": "Perfil guardado correctamente", "id": updated_row["id"]}
-
     except Exception as e:
-        # AQUÍ ESTÁ LA MAGIA: Esto sí lanza un error 500 real hacia Flutter
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -261,20 +256,22 @@ class UserCreate(BaseModel):
 class TripRequestCreate(BaseModel):
     passenger_id: str
     passenger_name: str
-    passenger_photo: Optional[str] = "https://i.pravatar.cc/150"
+    passenger_photo: Optional[str] = "https://i.pravatar.cc/150?img=31"
     passenger_rating: Optional[str] = "5.0"
     seats_requested: int
     sender_id: str
 
-# Este será nuestro "Trigger"
 @rutas_protegidas.post("/users/{user_id}")
 async def create_initial_user(user_id: str, user: UserCreate):
+    """
+    Registra un nuevo usuario en la base de datos cuando se crea su cuenta en Cognito.
+    
+    Si el usuario ya existe, no hace nada (evita duplicados).
+    Guarda el ID de Cognito y el nombre del usuario.
+    """
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
-
-        # Insertamos el usuario con su ID de Cognito y su nombre real.
-        # Si por alguna razón ya existe (ON CONFLICT), no hacemos nada (DO NOTHING).
         query = """
             INSERT INTO drivers (id, name)
             VALUES ($1, $2)
@@ -282,20 +279,24 @@ async def create_initial_user(user_id: str, user: UserCreate):
         """
         await conn.execute(query, user_id, user.name)
         await conn.close()
-
-        return {"message": "Usuario registrado en PostgreSQL exitosamente"}
-
+        return {"message": "Usuario registrado en PostgreSQL correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @rutas_protegidas.post("/trips/{driver_id}")
-async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuario_actual)): 
+async def create_trip(trip: TripCreate, driver_id: str = Depends(obtener_usuario_actual)):
+    """
+    Crea un nuevo viaje publicado por un conductor.
+    
+    Valida que el conductor no tenga un viaje activo ya.
+    Decodifica la ruta (polyline) a coordenadas y las guarda como geometría en PostGIS.
+    Almacena ubicación de origen, destino y la ruta completa con soporte geoespacial.
+    """
     conn = None
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # 1. Validación de viaje activo 
         check_query = "SELECT id FROM trips WHERE driver_id = $1 AND status = 'activo';"
         viaje_activo = await conn.fetchrow(check_query, driver_id)
 
@@ -305,21 +306,13 @@ async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuari
                 detail="Ya tienes un viaje activo. Debes finalizarlo antes de publicar uno nuevo."
             )
 
-        # 2. Decodificación de la polyline y conversión a WKT para PostGIS
         try:
-            # polyline.decode devuelve una lista de tuplas (latitud, longitud)
             coords = polyline.decode(trip.encoded_polyline)
-            
-            # PostGIS necesita LONGITUD primero y LATITUD después.
-            # Convertimos la lista en un string: "lon1 lat1, lon2 lat2, lon3 lat3..."
             linestring_coords = ", ".join([f"{lon} {lat}" for lat, lon in coords])
-            
-            # Armamos el formato WKT final
             route_wkt = f"LINESTRING({linestring_coords})"
         except Exception as e:
             raise HTTPException(status_code=400, detail="La polyline proporcionada no es válida.")
 
-        # 3. Query de inserción espacial actualizada con route_geom
         insert_query = """
             INSERT INTO trips (
                 driver_id, origin_name, dest_name, duration_text,
@@ -328,13 +321,12 @@ async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuari
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, 'activo',
-                ST_SetSRID(ST_MakePoint($8, $9), 4326),  -- Origen: Longitud, Latitud
-                ST_SetSRID(ST_MakePoint($10, $11), 4326), -- Destino: Longitud, Latitud
-                ST_GeomFromText($12, 4326)               -- ⚡ Ruta Completa: LINESTRING
+                ST_SetSRID(ST_MakePoint($8, $9), 4326),
+                ST_SetSRID(ST_MakePoint($10, $11), 4326),
+                ST_GeomFromText($12, 4326)
             ) RETURNING id;
         """
 
-        # 4. Ejecución (Añadimos route_wkt como el parámetro $12)
         nuevo_id = await conn.fetchval(
             insert_query,
             driver_id,
@@ -344,19 +336,18 @@ async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuari
             trip.departure_time,
             trip.price,
             trip.seats_available,
-            trip.origin_lng, trip.origin_lat,  
-            trip.dest_lng, trip.dest_lat,      
-            route_wkt # ⚡ Mandamos el string decodificado a Postgres
+            trip.origin_lng, trip.origin_lat,
+            trip.dest_lng, trip.dest_lat,
+            route_wkt
         )
 
-        return {"message": "Viaje publicado con éxito", "trip_id": nuevo_id}
+        return {"message": "Viaje publicado correctamente", "trip_id": nuevo_id}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error detectado: {e}")
+        print(f"Error al crear viaje: {e}")
         raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
-
     finally:
         if conn and not conn.is_closed():
             await conn.close()
@@ -364,25 +355,33 @@ async def create_trip( trip: TripCreate, driver_id: str = Depends(obtener_usuari
 class RequestStatusUpdate(BaseModel):
     status: str
 
-# 1. Obtener el viaje activo del conductor
 @rutas_protegidas.get("/trips/active/{driver_id}")
 async def get_active_trip(driver_id: str):
+    """
+    Obtiene el viaje activo actual del conductor.
+    
+    Retorna todos los detalles del viaje (origen, destino, precio, asientos, etc.)
+    o None si no hay viaje activo.
+    """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
-    # Buscamos el último viaje del conductor (puedes ajustar la lógica después)
     query = "SELECT * FROM trips WHERE driver_id = $1 and status = 'activo' ORDER BY id DESC LIMIT 1;"
     trip = await conn.fetchrow(query, driver_id)
     await conn.close()
     return dict(trip) if trip else None
 
-# 2. Obtener las solicitudes de ese viaje
 @rutas_protegidas.get("/trips/{trip_id}/requests")
 async def get_trip_requests(trip_id: int):
+    """
+    Obtiene todas las solicitudes de pasajeros pendientes para un viaje específico.
+    
+    Retorna información del pasajero (nombre, foto, rating) y cantidad de asientos solicitados.
+    Ordena por ID para mostrar las solicitudes en orden de llegada.
+    """
     conn = None
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # Traemos todas las solicitudes pendientes para este viaje
         query = """
             SELECT id, trip_id, passenger_id, passenger_name, passenger_photo,
                    passenger_rating, seats_requested, status
@@ -393,29 +392,32 @@ async def get_trip_requests(trip_id: int):
 
         resultados = await conn.fetch(query, trip_id)
         return [dict(r) for r in resultados]
-
     except Exception as e:
-        print(f"Error obteniendo peticiones: {e}")
-        raise HTTPException(status_code=500, detail="Error al obtener peticiones")
+        print(f"Error obteniendo solicitudes: {e}")
+        raise HTTPException(status_code=500, detail="Error al obtener solicitudes")
     finally:
         if conn and not conn.is_closed():
             await conn.close()
 
-# 3. Aceptar o rechazar una solicitud
 @rutas_protegidas.put("/requests/{request_id}/status")
 async def update_request_status(
-    request_id: int, 
+    request_id: int,
     update: RequestStatusUpdate,
-    background_tasks: BackgroundTasks  #tareas en 2do plano
+    background_tasks: BackgroundTasks
 ):
-    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    """
+    Actualiza el estado de una solicitud de viaje (aceptada o rechazada).
     
+    Cuando se acepta o rechaza, envía automáticamente una notificación push
+    al pasajero informándole de la decisión del conductor.
+    La notificación se envía en segundo plano para no bloquear la respuesta.
+    """
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
-        # 1. Actualizamos el estado y usamos RETURNING para sacar el ID del pasajero de inmediato
         query_update = """
-            UPDATE trip_requests 
-            SET status = $1 
-            WHERE id = $2 
+            UPDATE trip_requests
+            SET status = $1
+            WHERE id = $2
             RETURNING passenger_id;
         """
         passenger_id = await conn.fetchval(query_update, update.status, request_id)
@@ -423,41 +425,48 @@ async def update_request_status(
         if not passenger_id:
             raise HTTPException(status_code=404, detail="Solicitud no encontrada")
 
-        # hacemos una query para pedir el token FMC
         query_token = "SELECT fcm_token FROM drivers WHERE id = $1;"
         fcm_token = await conn.fetchval(query_token, passenger_id)
 
-        # Preparamos el mensaje dependiendo de la decisión del conductor
         if fcm_token:
             titulo = ""
             cuerpo = ""
-            
+
             if update.status == "aceptado":
-                titulo = "¡Lugar Asegurado! 🚗✅"
-                cuerpo = "El conductor ha aceptado tu solicitud. ¡Prepárate para el viaje!"
+                titulo = "Lugar Asegurado"
+                cuerpo = "El conductor ha aceptado tu solicitud. Prepárate para el viaje."
             elif update.status == "rechazado":
-                titulo = "Viaje lleno 😔"
+                titulo = "Viaje Lleno"
                 cuerpo = "El conductor no pudo aceptar tu solicitud esta vez."
-                
-            # Disparamos la notificación en segundo plano
+
             if titulo:
                 background_tasks.add_task(enviar_notificacion_push, fcm_token, titulo, cuerpo)
 
-        return {"message": "Estado actualizado exitosamente"}
-        
+        return {"message": "Estado actualizado correctamente"}
     finally:
         await conn.close()
 
 
 @rutas_protegidas.post("/trips/{trip_id}/requests")
-async def create_trip_request(trip_id: int, req: TripRequestCreate):
+async def create_trip_request(trip_id: int, req: TripRequestCreate, background_tasks: BackgroundTasks):
+    """
+    Crea una solicitud para que un pasajero se una a un viaje existente.
+    
+    Valida que:
+    - El viaje exista y esté activo
+    - Haya asientos disponibles
+    - El pasajero no tenga otra solicitud pendiente para el mismo viaje
+    - El pasajero no sea el conductor del viaje
+    
+    Si todo es válido, guarda la solicitud como pendiente de aprobación.
+    Notifica al conductor que un pasajero solicitó unirse al viaje.
+    """
     conn = None
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
 
-        # 1. Validar que el viaje exista y tenga asientos suficientes
-        trip_query = "SELECT seats_available, status FROM trips WHERE id = $1"
+        trip_query = "SELECT seats_available, status, driver_id FROM trips WHERE id = $1"
         trip = await conn.fetchrow(trip_query, trip_id)
 
         if not trip:
@@ -467,11 +476,10 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
         if trip['seats_available'] < req.seats_requested:
             raise HTTPException(status_code=400, detail="No hay suficientes asientos disponibles")
 
-        # 2. Evitar solicitudes duplicadas del mismo pasajero
         check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status = 'pendiente'"
         duplicado = await conn.fetchrow(check_dup, trip_id, req.passenger_id)
 
-        selfrequest = "select id from trip_requests where (select driver_id from trips where id = $1) <> $2;" #
+        selfrequest = "select id from trip_requests where (select driver_id from trips where id = $1) <> $2;"
         selftrip = await conn.fetchrow(selfrequest, trip_id, req.sender_id)
 
         if not selftrip:
@@ -480,7 +488,6 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
         if duplicado:
             raise HTTPException(status_code=400, detail="Ya enviaste una solicitud para este viaje")
 
-        # 3. Insertar la solicitud
         insert_query = """
             INSERT INTO trip_requests (
                 trip_id, passenger_id, passenger_name, passenger_photo,
@@ -494,12 +501,20 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
             req.passenger_photo, req.passenger_rating, req.seats_requested
         )
 
-        return {"message": "Solicitud enviada al conductor AAAHHH", "request_id": request_id}
+        driver_id = trip['driver_id']
+        query_token = "SELECT fcm_token FROM drivers WHERE id = $1;"
+        fcm_token = await conn.fetchval(query_token, driver_id)
 
+        if fcm_token:
+            titulo = "Nueva Solicitud"
+            cuerpo = f"{req.passenger_name} solicita unirse a tu viaje."
+            background_tasks.add_task(enviar_notificacion_push, fcm_token, titulo, cuerpo)
+
+        return {"message": "Solicitud enviada al conductor", "request_id": request_id}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔥 ERROR AL SOLICITAR VIAJE: {e}")
+        print(f"Error al crear solicitud de viaje: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn and not conn.is_closed():
@@ -507,9 +522,16 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate):
 
 @rutas_protegidas.get("/trips/search")
 async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
+    """
+    Busca viajes disponibles cercanos a las coordenadas de origen y destino.
+    
+    Utiliza geolocalización PostGIS para encontrar viajes cuyo origen esté
+    dentro de 1km de la ubicación solicitada y cuyo destino también esté
+    dentro de 1km de la ubicación destino. Retorna solo viajes activos
+    con asientos disponibles, ordenados por hora de salida.
+    """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
 
-    # ST_DWithin calcula la distancia en metros sobre la esfera terrestre
     query = """
         SELECT
             t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available, t.distance_text, t.duration_text,
@@ -523,48 +545,51 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
         ORDER BY t.departure_time ASC;
     """
 
-    # Cuidado: En PostGIS el orden es (Longitud, Latitud)
     resultados = await conn.fetch(query, olng, olat, dlng, dlat)
     await conn.close()
-
     return [dict(r) for r in resultados]
 
 @rutas_protegidas.patch("/trips/{trip_id}/cancelar")
 async def delete_trip(trip_id: int):
-    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    """
+    Cancela un viaje y todas sus solicitudes asociadas.
     
+    Cambia el estado del viaje a 'cancelado' (soft delete).
+    También marca todas las solicitudes del viaje como canceladas
+    para mantener historial de transacciones.
+    """
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
-       
         query = "UPDATE trips SET status = 'cancelado' WHERE id = $1;"
-        quey_delete_requests = "UPDATE trip_requests SET status = 'cancelado' WHERE trip_id = $1;"
-        
+        query_delete_requests = "UPDATE trip_requests SET status = 'cancelado' WHERE trip_id = $1;"
+
         resultado = await conn.execute(query, trip_id)
-        
-        # Verificamos si realmente se afectó alguna fila
+
         if resultado == "UPDATE 0":
-            raise HTTPException(status_code=404, detail="Viaje no encontrado o ya eliminado")
-        
-        await conn.execute(quey_delete_requests, trip_id)
-            
-        return {"message": "Viaje eliminado exitosamente", "exito": True}
-        
+            raise HTTPException(status_code=404, detail="Viaje no encontrado o ya cancelado")
+
+        await conn.execute(query_delete_requests, trip_id)
+        return {"message": "Viaje cancelado correctamente", "exito": True}
     except Exception as e:
-        print(f"Error al eliminar viaje: {e}")
+        print(f"Error al cancelar viaje: {e}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
-        
     finally:
-        # SIEMPRE cerrar la conexión, incluso si el código falla
         await conn.close()
 
 @rutas_protegidas.get("/mis-viajes/aprobados/{passenger_id}")
 async def get_viajes_aprobados(passenger_id: str):
+    """
+    Obtiene todos los viajes aprobados para un pasajero específico.
+    
+    Busca las solicitudes aceptadas del pasajero y retorna información
+    completa del viaje y del conductor (nombre, biografía, vehículos, preferencias).
+    Ordena los viajes por hora de salida próxima.
+    """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
-        # Hacemos un JOIN entre trips y trip_requests. 
-        # Adaptalo a los nombres exactos de tus columnas.
         query = """
-            SELECT 
-                t.*, 
+            SELECT
+                t.*,
                 tr.status as request_status,
                 u.name as driver_name,
                 u.biography as driver_biography,
@@ -573,14 +598,12 @@ async def get_viajes_aprobados(passenger_id: str):
             FROM trips t
             INNER JOIN trip_requests tr ON t.id = tr.trip_id
             INNER JOIN drivers u ON t.driver_id = u.id
-            WHERE tr.passenger_id = $1 
+            WHERE tr.passenger_id = $1
             AND tr.status = 'aceptado'
             AND t.status != 'cancelled'
             ORDER BY t.departure_time ASC;
         """
         viajes = await conn.fetch(query, passenger_id)
-        
-        # Convertimos los registros a una lista de diccionarios para mandar el JSON
         return [dict(viaje) for viaje in viajes]
     except Exception as e:
         print(f"Error al obtener viajes aprobados: {e}")
@@ -590,27 +613,41 @@ async def get_viajes_aprobados(passenger_id: str):
 
 
 @rutas_protegidas.patch("/trips/{trip_id}/pasajeros/{passenger_id}/cancelar")
-async def cancelar_asiento_pasajero(trip_id: int, passenger_id: str):
+async def cancelar_asiento_pasajero(trip_id: int, passenger_id: str, background_tasks: BackgroundTasks):
+    """
+    Cancela la reserva de un pasajero en un viaje específico.
+    
+    Marca la solicitud como cancelada por el pasajero (soft delete).
+    Mantiene el registro histórico sin eliminar la solicitud de la base de datos.
+    Notifica al conductor que un pasajero canceló su reserva.
+    """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
-        # 1. Actualizamos el estatus en la tabla de solicitudes a "cancelado por pasajero"
-        # Usamos Soft Delete para mantener el registro de que alguna vez estuvo ahí
+        query_driver = "SELECT driver_id FROM trips WHERE id = $1;"
+        driver_id = await conn.fetchval(query_driver, trip_id)
+
+        if not driver_id:
+            raise HTTPException(status_code=404, detail="El viaje no existe")
+
         query_update = """
-            UPDATE trip_requests 
-            SET status = 'cancelled_by_passen' 
+            UPDATE trip_requests
+            SET status = 'cancelled_by_passen'
             WHERE trip_id = $1 AND passenger_id = $2 AND status = 'aceptado';
         """
         resultado = await conn.execute(query_update, trip_id, passenger_id)
-        
+
         if resultado == "UPDATE 0":
             raise HTTPException(status_code=400, detail="No se encontró una reserva activa para cancelar")
 
-        # 2. (Opcional pero recomendado) Sumarle +1 a los asientos disponibles en la tabla trips
-        # query_seats = "UPDATE trips SET seats_available = seats_available + 1 WHERE id = $1;"
-        # await conn.execute(query_seats, trip_id)
+        query_token = "SELECT fcm_token FROM drivers WHERE id = $1;"
+        fcm_token = await conn.fetchval(query_token, driver_id)
 
-        return {"message": "Asiento cancelado con éxito", "success": True}
-        
+        if fcm_token:
+            titulo = "Pasajero Canceló"
+            cuerpo = "Un pasajero ha cancelado su asiento en el viaje."
+            background_tasks.add_task(enviar_notificacion_push, fcm_token, titulo, cuerpo)
+
+        return {"message": "Asiento cancelado correctamente", "success": True}
     except Exception as e:
         print(f"Error cancelando asiento: {e}")
         raise HTTPException(status_code=500, detail="Error al cancelar")
@@ -622,9 +659,15 @@ class FCMTokenUpdate(BaseModel):
 
 @rutas_protegidas.patch("/api/users/update-fcm-token")
 async def update_fcm_token(
-    data: FCMTokenUpdate, 
+    data: FCMTokenUpdate,
     user_id: str = Depends(obtener_usuario_actual)
 ):
+    """
+    Actualiza el token FCM de un usuario para recibir notificaciones push.
+    
+    El token es proporcionado por Firebase en el dispositivo del usuario
+    y se usa para enviarle notificaciones sobre cambios en sus viajes.
+    """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
         query = "UPDATE drivers SET fcm_token = $1 WHERE id = $2;"
