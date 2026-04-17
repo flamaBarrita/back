@@ -172,26 +172,6 @@ async def health_check():
 
     return status
 
-@rutas_protegidas.get("/drivers")
-async def get_drivers():
-    """
-    Obtiene la lista de todos los conductores con su ID, nombre y estado.
-    
-    Consulta la tabla drivers y retorna los datos básicos de cada conductor.
-    """
-    results = []
-    try:
-        url_limpia = DATABASE_URL.replace("+asyncpg", "")
-        conn = await asyncpg.connect(url_limpia)
-        rows = await conn.fetch("SELECT id, name, status FROM drivers")
-        for row in rows:
-            results.append(dict(row))
-        await conn.close()
-        return results
-    except Exception as e:
-        return {"error": str(e)}
-    
-
 @rutas_protegidas.get("/profile/{user_id}")
 async def get_profile(user_id: str):
     """
@@ -366,8 +346,26 @@ async def get_active_trip(driver_id: str):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     query = "SELECT * FROM trips WHERE driver_id = $1 and status = 'activo' ORDER BY id DESC LIMIT 1;"
     trip = await conn.fetchrow(query, driver_id)
+    if not trip:
+        await conn.close()
+        return None
+    trip_dict = dict(trip)
+    
+    # Buscamos los pasajeros vinculados a este viaje 
+    query_passengers = """
+        SELECT u.id, u.name 
+        FROM users u
+        JOIN trip_requests r ON u.id = r.passenger_id
+        WHERE r.trip_id = $1 AND r.status = 'accepted';
+    """
+    passengers = await conn.fetch(query_passengers, trip_dict['id'])
+    
+    # Convertimos los registros en una lista de diccionarios y los anidamos
+    trip_dict['passengers'] = [dict(p) for p in passengers]
+    
     await conn.close()
-    return dict(trip) if trip else None
+    
+    return trip_dict
 
 @rutas_protegidas.get("/trips/{trip_id}/requests")
 async def get_trip_requests(trip_id: int):
