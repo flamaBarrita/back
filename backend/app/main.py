@@ -356,7 +356,7 @@ async def get_active_trip(driver_id: str):
         SELECT u.id, u.name 
         FROM drivers u
         JOIN trip_requests r ON u.id = r.passenger_id
-        WHERE r.trip_id = $1 AND r.status = 'accepted';
+        WHERE r.trip_id = $1 AND r.status = 'aceptado';
     """
     passengers = await conn.fetch(query_passengers, trip_dict['id'])
     
