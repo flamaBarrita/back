@@ -350,13 +350,15 @@ async def get_active_trip(driver_id: str):
         await conn.close()
         return None
     trip_dict = dict(trip)
-    
+    print(trip_dict, driver_id)
     # Buscamos los pasajeros vinculados a este viaje 
     query_passengers = """
-        SELECT u.id, u.name 
-        FROM drivers u
-        JOIN trip_requests r ON u.id = r.passenger_id
-        WHERE r.trip_id = $1 AND r.status = 'aceptado';
+       SELECT d.id, d.name 
+        FROM drivers d
+        JOIN trip_requests r 
+        ON d.id = r.passenger_id
+        WHERE r.trip_id = $1
+        AND r.status = 'aceptado';
     """
     passengers = await conn.fetch(query_passengers, trip_dict['id'])
     
