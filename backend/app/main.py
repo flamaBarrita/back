@@ -354,7 +354,7 @@ async def get_active_trip(driver_id: str):
     # Buscamos los pasajeros vinculados a este viaje 
     query_passengers = """
         SELECT u.id, u.name 
-        FROM users u
+        FROM drivers u
         JOIN trip_requests r ON u.id = r.passenger_id
         WHERE r.trip_id = $1 AND r.status = 'accepted';
     """
