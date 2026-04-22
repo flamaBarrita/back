@@ -350,7 +350,6 @@ async def get_active_trip(driver_id: str):
         await conn.close()
         return None
     trip_dict = dict(trip)
-    print(trip_dict, driver_id)
     # Buscamos los pasajeros vinculados a este viaje 
     query_passengers = """
        SELECT d.id, d.name 
@@ -476,7 +475,7 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate, background_t
         if trip['seats_available'] < req.seats_requested:
             raise HTTPException(status_code=400, detail="No hay suficientes asientos disponibles")
 
-        check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status = 'pendiente'"
+        check_dup = "SELECT id FROM trip_requests WHERE trip_id = $1 AND passenger_id = $2 AND status IN ('pendiente', 'aceptado')"
         duplicado = await conn.fetchrow(check_dup, trip_id, req.passenger_id)
 
         selfrequest = "select id from trip_requests where (select driver_id from trips where id = $1) <> $2;"
@@ -486,7 +485,7 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate, background_t
             raise HTTPException(status_code=400, detail="No puedes solicitar tu propio viaje")
 
         if duplicado:
-            raise HTTPException(status_code=400, detail="Ya enviaste una solicitud para este viaje")
+            raise HTTPException(status_code=400, detail="Ya tienes un lugar en este viaje o una solicitud pendiente")
 
         insert_query = """
             INSERT INTO trip_requests (
@@ -550,16 +549,26 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     return [dict(r) for r in resultados]
 
 @rutas_protegidas.patch("/trips/{trip_id}/cancelar")
-async def delete_trip(trip_id: int):
+async def delete_trip(trip_id: int, background_tasks: BackgroundTasks):
     """
     Cancela un viaje y todas sus solicitudes asociadas.
     
     Cambia el estado del viaje a 'cancelado' (soft delete).
     También marca todas las solicitudes del viaje como canceladas
     para mantener historial de transacciones.
+    Envía notificaciones a todos los pasajeros que estaban aceptados en el viaje.
     """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     try:
+        # Primero obtener los FCM tokens de los pasajeros aceptados ANTES de actualizar
+        query_passengers_fcm = """
+            SELECT d.fcm_token
+            FROM drivers d
+            JOIN trip_requests tr ON d.id = tr.passenger_id
+            WHERE tr.trip_id = $1 AND tr.status = 'aceptado' AND d.fcm_token IS NOT NULL;
+        """
+        passengers_tokens = await conn.fetch(query_passengers_fcm, trip_id)
+        
         query = "UPDATE trips SET status = 'cancelado' WHERE id = $1;"
         query_delete_requests = "UPDATE trip_requests SET status = 'cancelado' WHERE trip_id = $1;"
 
@@ -569,6 +578,15 @@ async def delete_trip(trip_id: int):
             raise HTTPException(status_code=404, detail="Viaje no encontrado o ya cancelado")
 
         await conn.execute(query_delete_requests, trip_id)
+        
+        # Enviar notificaciones a cada pasajero
+        titulo = "Viaje Cancelado"
+        cuerpo = "El conductor ha cancelado el viaje. Busca un nuevo transporte."
+        
+        for row in passengers_tokens:
+            if row['fcm_token']:
+                background_tasks.add_task(enviar_notificacion_push, row['fcm_token'], titulo, cuerpo)
+        
         return {"message": "Viaje cancelado correctamente", "exito": True}
     except Exception as e:
         print(f"Error al cancelar viaje: {e}")
