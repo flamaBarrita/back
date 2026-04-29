@@ -697,6 +697,46 @@ async def update_fcm_token(
     finally:
         await conn.close()
 
+class FotoActualizar(BaseModel):
+    foto_url: str
+
+# 2. Tu endpoint con el formato asyncpg
+@rutas_protegidas.patch("/usuarios/{usuario_id}/foto")
+async def actualizar_foto_perfil(usuario_id: str, payload: FotoActualizar):
+    """
+    Actualiza la URL de la foto de perfil de un usuario.
+    
+    Permite registrar la foto por primera vez o reemplazar una existente.
+    Guarda el enlace directo proporcionado por Firebase Storage en el registro del usuario.
+    """
+    # Conexión directa a la base de datos
+    conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
+    
+    try:
+        # 1. Verificamos si el usuario existe (Ajusta 'usuarios' al nombre real de tu tabla)
+        query_user = "SELECT id FROM drivers WHERE id = $1;"
+        existe_usuario = await conn.fetchval(query_user, usuario_id)
+
+        if not existe_usuario:
+            raise HTTPException(status_code=404, detail="El usuario no existe")
+
+        # 2. Actualizamos el campo de la foto
+        query_update = """
+            UPDATE drivers
+            SET foto_url = $1
+            WHERE id = $2;
+        """
+        # Ejecutamos el update pasándole la URL y el ID
+        await conn.execute(query_update, payload.foto_url, usuario_id)
+
+        return {
+            "mensaje": "Foto de perfil actualizada exitosamente",
+            "foto_url": payload.foto_url
+        }
+        
+    finally:
+        await conn.close()
+
 app.include_router(rutas_protegidas)
 
 
