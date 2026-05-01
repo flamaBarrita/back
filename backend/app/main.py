@@ -182,7 +182,7 @@ async def get_profile(user_id: str):
     try:
         url_limpia = DATABASE_URL.replace("+asyncpg", "")
         conn = await asyncpg.connect(url_limpia)
-        query = "SELECT name, biography, preferences, vehicles FROM drivers WHERE id = $1"
+        query = "SELECT name, biography, preferences, vehicles, foto_url FROM drivers WHERE id = $1"
         row = await conn.fetchrow(query, user_id)
         await conn.close()
 
@@ -700,7 +700,6 @@ async def update_fcm_token(
 class FotoActualizar(BaseModel):
     foto_url: str
 
-# 2. Tu endpoint con el formato asyncpg
 @rutas_protegidas.patch("/usuarios/{usuario_id}/foto")
 async def actualizar_foto_perfil(usuario_id: str, payload: FotoActualizar):
     """
@@ -709,18 +708,17 @@ async def actualizar_foto_perfil(usuario_id: str, payload: FotoActualizar):
     Permite registrar la foto por primera vez o reemplazar una existente.
     Guarda el enlace directo proporcionado por Firebase Storage en el registro del usuario.
     """
-    # Conexión directa a la base de datos
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
     
     try:
-        # 1. Verificamos si el usuario existe (Ajusta 'usuarios' al nombre real de tu tabla)
+        # Verificamos si el usuario existe
         query_user = "SELECT id FROM drivers WHERE id = $1;"
         existe_usuario = await conn.fetchval(query_user, usuario_id)
 
         if not existe_usuario:
             raise HTTPException(status_code=404, detail="El usuario no existe")
 
-        # 2. Actualizamos el campo de la foto
+        # Actualizamos el campo de la foto
         query_update = """
             UPDATE drivers
             SET foto_url = $1
