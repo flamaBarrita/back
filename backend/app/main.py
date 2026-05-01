@@ -352,7 +352,7 @@ async def get_active_trip(driver_id: str):
     trip_dict = dict(trip)
     # Buscamos los pasajeros vinculados a este viaje 
     query_passengers = """
-       SELECT d.id, d.name 
+       SELECT d.id, d.name, d.foto_url
         FROM drivers d
         JOIN trip_requests r 
         ON d.id = r.passenger_id
@@ -534,7 +534,7 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     query = """
         SELECT
             t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available, t.distance_text, t.duration_text,
-            u.id AS driver_id, u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles
+            u.id AS driver_id, u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles, u.foto_url AS driver_foto_url
         FROM trips t
         JOIN drivers u ON t.driver_id = u.id
         WHERE t.status = 'activo'
