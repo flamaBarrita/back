@@ -524,16 +524,12 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     """
     Busca viajes disponibles cuya ruta pase cerca del origen y destino del pasajero.
     
-    Utiliza geolocalización PostGIS para encontrar viajes donde:
-    - El origen del pasajero esté a <= 500m de la ruta del conductor
-    - El destino del pasajero esté a <= 500m de la ruta del conductor
-    - El pasajero viaje en la misma dirección que el conductor
-      (origen del pasajero aparece ANTES que su destino en la ruta)
+    Crea dos círculos (buffers) de 500m alrededor del origen y destino del pasajero
+    usando ST_Buffer en geografía. Luego verifica con ST_Intersects qué rutas
+    de conductores pasan por ambos círculos.
     
-    La ruta del conductor se densifica con ST_Segmentize para asegurar
-    que puntos intermedios (recogidas en mitad del trayecto) se detecten
-    correctamente, incluso si la polyline simplificada de Google no incluye
-    vértices suficientes en esa zona.
+    Esto permite recogidas en cualquier punto de la ruta, no solo en el origen
+    exacto del conductor. (Ej. un pasajero en la mitad del trayecto).
     
     Retorna solo viajes activos con asientos disponibles,
     ordenados por hora de salida.
@@ -541,40 +537,34 @@ async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
 
     query = """
-        WITH viajes_con_ruta_densa AS (
+        WITH pasajero_circulos AS (
             SELECT
-                t.*,
-                -- Densificar la ruta cada 100 metros para matching preciso
-                ST_Segmentize(t.route_geom::geography, 100)::geometry AS route_geom_densa
-            FROM trips t
-            WHERE t.status = 'activo'
-              AND t.seats_available > 0
+                -- Círculo de 500m alrededor del ORIGEN del pasajero
+                ST_Buffer(
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                    500
+                )::geometry AS circulo_origen,
+                -- Círculo de 500m alrededor del DESTINO del pasajero
+                ST_Buffer(
+                    ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+                    500
+                )::geometry AS circulo_destino
         )
         SELECT
-            v.id, v.origin_name, v.dest_name, v.departure_time, v.price,
-            v.seats_available, v.distance_text, v.duration_text,
+            t.id, t.origin_name, t.dest_name, t.departure_time, t.price,
+            t.seats_available, t.distance_text, t.duration_text,
             u.id AS driver_id, u.name AS driver_name, u.biography,
             u.vehicles, u.preferences, u.foto_url AS driver_foto_url
-        FROM viajes_con_ruta_densa v
-        JOIN drivers u ON v.driver_id = u.id
-        WHERE
-          -- 1) Proximidad del origen del pasajero a la ruta (<= 500m)
-          ST_DWithin(
-              v.route_geom_densa::geography,
-              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-              500
-          )
-          -- 2) Proximidad del destino del pasajero a la ruta (<= 500m)
-          AND ST_DWithin(
-              v.route_geom_densa::geography,
-              ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-              500
-          )
-          -- 3) Dirección correcta: origen del pasajero aparece ANTES
-          --     que su destino en el recorrido del conductor
-          AND ST_LineLocatePoint(v.route_geom_densa, ST_SetSRID(ST_MakePoint($1, $2), 4326))
-              < ST_LineLocatePoint(v.route_geom_densa, ST_SetSRID(ST_MakePoint($3, $4), 4326))
-        ORDER BY v.departure_time ASC;
+        FROM trips t
+        JOIN drivers u ON t.driver_id = u.id
+        CROSS JOIN pasajero_circulos c
+        WHERE t.status = 'activo'
+          AND t.seats_available > 0
+          -- La ruta del conductor debe pasar por el círculo del origen
+          AND ST_Intersects(t.route_geom, c.circulo_origen)
+          -- La ruta del conductor debe pasar por el círculo del destino
+          AND ST_Intersects(t.route_geom, c.circulo_destino)
+        ORDER BY t.departure_time ASC;
     """
 
     resultados = await conn.fetch(query, olng, olat, dlng, dlat)
