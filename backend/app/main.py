@@ -522,26 +522,59 @@ async def create_trip_request(trip_id: int, req: TripRequestCreate, background_t
 @rutas_protegidas.get("/trips/search")
 async def search_trips(olat: float, olng: float, dlat: float, dlng: float):
     """
-    Busca viajes disponibles cercanos a las coordenadas de origen y destino.
+    Busca viajes disponibles cuya ruta pase cerca del origen y destino del pasajero.
     
-    Utiliza geolocalización PostGIS para encontrar viajes cuyo origen esté
-    dentro de 1km de la ubicación solicitada y cuyo destino también esté
-    dentro de 1km de la ubicación destino. Retorna solo viajes activos
-    con asientos disponibles, ordenados por hora de salida.
+    Utiliza geolocalización PostGIS para encontrar viajes donde:
+    - El origen del pasajero esté a <= 500m de la ruta del conductor
+    - El destino del pasajero esté a <= 500m de la ruta del conductor
+    - El pasajero viaje en la misma dirección que el conductor
+      (origen del pasajero aparece ANTES que su destino en la ruta)
+    
+    La ruta del conductor se densifica con ST_Segmentize para asegurar
+    que puntos intermedios (recogidas en mitad del trayecto) se detecten
+    correctamente, incluso si la polyline simplificada de Google no incluye
+    vértices suficientes en esa zona.
+    
+    Retorna solo viajes activos con asientos disponibles,
+    ordenados por hora de salida.
     """
     conn = await asyncpg.connect(DATABASE_URL.replace("+asyncpg", ""))
 
     query = """
+        WITH viajes_con_ruta_densa AS (
+            SELECT
+                t.*,
+                -- Densificar la ruta cada 100 metros para matching preciso
+                ST_Segmentize(t.route_geom::geography, 100)::geometry AS route_geom_densa
+            FROM trips t
+            WHERE t.status = 'activo'
+              AND t.seats_available > 0
+        )
         SELECT
-            t.id, t.origin_name, t.dest_name, t.departure_time, t.price, t.seats_available, t.distance_text, t.duration_text,
-            u.id AS driver_id, u.name AS driver_name, u.biography, u.vehicles, u.preferences, u.vehicles, u.foto_url AS driver_foto_url
-        FROM trips t
-        JOIN drivers u ON t.driver_id = u.id
-        WHERE t.status = 'activo'
-          AND t.seats_available > 0
-          AND ST_DWithin(t.origin_geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 1000)
-          AND ST_DWithin(t.dest_geom::geography, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, 1000)
-        ORDER BY t.departure_time ASC;
+            v.id, v.origin_name, v.dest_name, v.departure_time, v.price,
+            v.seats_available, v.distance_text, v.duration_text,
+            u.id AS driver_id, u.name AS driver_name, u.biography,
+            u.vehicles, u.preferences, u.foto_url AS driver_foto_url
+        FROM viajes_con_ruta_densa v
+        JOIN drivers u ON v.driver_id = u.id
+        WHERE
+          -- 1) Proximidad del origen del pasajero a la ruta (<= 500m)
+          ST_DWithin(
+              v.route_geom_densa::geography,
+              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+              500
+          )
+          -- 2) Proximidad del destino del pasajero a la ruta (<= 500m)
+          AND ST_DWithin(
+              v.route_geom_densa::geography,
+              ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+              500
+          )
+          -- 3) Dirección correcta: origen del pasajero aparece ANTES
+          --     que su destino en el recorrido del conductor
+          AND ST_LineLocatePoint(v.route_geom_densa, ST_SetSRID(ST_MakePoint($1, $2), 4326))
+              < ST_LineLocatePoint(v.route_geom_densa, ST_SetSRID(ST_MakePoint($3, $4), 4326))
+        ORDER BY v.departure_time ASC;
     """
 
     resultados = await conn.fetch(query, olng, olat, dlng, dlat)
