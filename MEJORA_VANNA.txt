@@ -1,0 +1,440 @@
+MEJORA_VANNA — Revisión técnica y propuesta de refactor
+App de viajes compartidos para estudiantes universitarios (estilo BlaBlaCar)
+Backend: FastAPI (back_blabla/backend) · Frontend: Flutter (blablacar/blablacar)
+================================================================================
+
+RESUMEN GENERAL
+--------------------------------------------------------------------------------
+La arquitectura general está bien pensada: el backend separa routers → services →
+repositories, todas las queries SQL están parametrizadas (sin inyección SQL), y
+el frontend usa Riverpod de forma consistente para estado. El problema no es el
+diseño de alto nivel, sino bugs concretos de seguridad y de lógica de negocio que
+hacen que la app, tal como está, sea explotable y tenga fallos funcionales reales.
+
+Este documento junta los hallazgos de la revisión de:
+  1. Backend — core/infraestructura (auth, DB, Redis, Firebase, Docker, esquema SQL)
+  2. Backend — lógica de negocio (routers, services, repositories, schemas, tests)
+  3. Frontend — servicios/estado (api_service, auth, providers, storage, maps)
+  4. Frontend — pantallas/widgets (navegación, UI, chat, formularios)
+
+Cada hallazgo indica severidad: [CRÍTICO] [MODERADO] [MENOR]
+
+
+================================================================================
+1. CRÍTICO — romper hoy / explotable hoy
+================================================================================
+
+1.1 Autorización rota (IDOR) en casi todos los endpoints — BACKEND + FRONTEND
+--------------------------------------------------------------------------------
+`obtener_usuario_actual` (backend/app/core/security.py) valida correctamente el
+JWT de Cognito, pero la mayoría de los routers lo usan solo como
+`dependencies=[Depends(obtener_usuario_actual)]` sin capturar el resultado —
+el identificador de usuario devuelto se descarta, y los endpoints confían en el
+user_id/driver_id/passenger_id que manda el CLIENTE en la URL o el body.
+
+Consecuencia: cualquier usuario autenticado puede, hoy mismo:
+  - Editar el perfil o la foto de otro usuario
+    PUT /profile/{user_id}         (routers/profile.py)
+    PATCH /usuarios/{usuario_id}/foto  (routers/profile.py)
+  - Publicar un viaje "como" otro conductor
+    POST /trips/{driver_id}        (routers/trips.py)
+  - Cancelar el viaje de OTRO conductor
+    PATCH /trips/{trip_id}/cancelar   (routers/trips.py)
+  - Aceptar/rechazar solicitudes de viajes ajenos (auto-aprobarse un lugar,
+    o sabotear la solicitud de otro pasajero)
+    PUT /requests/{request_id}/status (routers/requests.py)
+  - Cancelar el asiento de otro pasajero
+    PATCH /trips/{trip_id}/pasajeros/{passenger_id}/cancelar (routers/requests.py)
+  - Crear una solicitud de viaje suplantando a otro usuario, ya que
+    `passenger_id` y `sender_id` vienen del body del request, no del JWT
+    POST /trips/{trip_id}/requests (routers/requests.py, schemas/request.py)
+  - Ver información de otros usuarios sin ser el dueño del recurso (moderado
+    en impacto pero mismo patrón): viaje activo de cualquier driver_id,
+    lista de solicitudes pendientes de cualquier trip_id, viajes aprobados
+    de cualquier passenger_id.
+
+El único endpoint bien implementado es routers/notifications.py, que sí captura
+`user_id: str = Depends(obtener_usuario_actual)` y lo usa directamente — sirve
+de plantilla para corregir el resto.
+
+Lado Flutter (confirma el mismo problema desde el cliente):
+lib/services/api_service.dart manda estos IDs explícitamente en casi cada
+llamada: obtenerPerfil(userId), publicarViaje(driverId), solicitarUnirse
+(senderId + passengerId), registrarUsuarioInicial(userId), guardarPerfil
+(userId), getActiveTrip(driverId), obtenerMisViajesAprobados(passengerId),
+cancelarAsientoPasajero(tripId, passengerId), actualizarFotoPerfil(userId).
+En el camino feliz estos IDs vienen de currentUserIdProvider (el propio
+usuario), pero nada impide que un cliente modificado o una llamada directa a
+la API sustituya el ID de otra persona — el fix real tiene que ser en el
+servidor (derivar identidad del JWT), y el cliente debe dejar de requerir
+pasar esos IDs una vez arreglado el backend.
+
+FIX PROPUESTO: en cada endpoint sensible, derivar la identidad del `sub` del
+JWT (vía Depends(obtener_usuario_actual)) y comparar contra el recurso, o
+resolver la propiedad del recurso en el service (ej. para cancelar un viaje,
+buscar el driver_id real del trip en la BD y compararlo con el usuario
+autenticado, no confiar en el que manda el cliente). Lanzar UnauthorizedError
+(403) en caso de mismatch.
+
+
+1.2 Sobreventa de asientos — condición de carrera + falta de validación
+--------------------------------------------------------------------------------
+No existen transacciones en ningún repositorio (backend/app/repositories/*.py —
+cero uso de `conn.transaction()` o `SELECT ... FOR UPDATE`).
+`trips.seats_available` se fija una sola vez al crear el viaje y NUNCA se
+descuenta cuando se acepta una solicitud (request_repo.update_request_status
+no toca la tabla trips). `create_trip_request` solo compara
+`seats_available < seats_requested` en el momento de crear la solicitud, no
+contra los asientos ya consumidos por solicitudes previamente aceptadas.
+
+Consecuencia: un conductor puede aceptar múltiples solicitudes que en conjunto
+superen los asientos disponibles, y `search_trips` seguirá mostrando el viaje
+como disponible (`seats_available > 0`) aunque esté efectivamente lleno.
+Además, dos solicitudes simultáneas pueden pasar el check de cupo a la vez
+(TOCTOU race), agravado porque docker-compose corre 2 workers (2 pools de
+conexión separados).
+
+FIX PROPUESTO: envolver la aceptación de solicitud en una transacción con
+`SELECT ... FOR UPDATE` sobre el trip, o descontar seats_available de forma
+atómica en el UPDATE (`UPDATE trips SET seats_available = seats_available - $1
+WHERE id = $2 AND seats_available >= $1`), y verificar el resultado.
+
+
+1.3 Los viajes nunca expiran — bloquea al conductor de publicar de nuevo
+--------------------------------------------------------------------------------
+`search_trips` y `has_active_trip` (trip_repo.py) solo filtran por
+`status = 'activo'`, sin comparar `departure_time` contra NOW(). No hay job
+ni lógica de expiración en ningún lugar del código.
+
+Consecuencia real y visible para el usuario: un conductor queda BLOQUEADO
+PERMANENTEMENTE para publicar un nuevo viaje una vez que pasó la hora de
+salida del viaje anterior, porque el sistema lo sigue considerando "activo"
+para siempre. Además, viajes vencidos siguen apareciendo en resultados de
+búsqueda.
+
+FIX PROPUESTO: agregar `WHERE departure_time > NOW()` a las queries relevantes,
+y/o un job periódico (o trigger) que transicione `status` a 'completado' pasada
+la hora de salida.
+
+
+1.4 Firebase nunca se inicializa en el frontend
+--------------------------------------------------------------------------------
+lib/main.dart:14-16 tiene `Firebase.initializeApp(options:
+DefaultFirebaseOptions.currentPlatform)` COMENTADO, y no se llama en ningún
+otro lugar de lib/ (confirmado por búsqueda en todo el árbol).
+
+Sin embargo, la app depende de Firebase en tres subsistemas:
+  - firebase_messaging (push notifications) → lib/services/push_notifications.dart
+  - firebase_storage (subida de foto de perfil) → lib/services/storage.dart
+  - cloud_firestore (chat en tiempo real) → lib/providers/chat_provider.dart
+
+Sin `Firebase.initializeApp()`, los tres van a lanzar excepciones tipo
+`[core/no-app]` en el primer uso. Esto parece un remanente de debugging que
+quedó comentado y se subió así — casi seguro que hoy notificaciones push,
+chat y subida de foto están rotos o crashean en la rama actual.
+
+FIX PROPUESTO: descomentar la llamada en main.dart antes que cualquier otra
+cosa (es la corrección de más impacto y menor esfuerzo de todo este documento).
+
+
+1.5 Dockerfile de producción inseguro
+--------------------------------------------------------------------------------
+backend/Dockerfile:
+  - No tiene directiva `USER` — el contenedor corre como root.
+  - Build en un solo stage: build-essential, libpq-dev, gdal-bin quedan en la
+    imagen final (el comentario del Dockerfile dice que son para
+    "SQLAlchemy/GeoAlchemy", pero el código usa asyncpg puro — ninguno de esos
+    paquetes está en requirements.txt; parece razón copiada/vestigial).
+  - No hay `.dockerignore` (ni en la raíz ni en backend/) — `COPY . .` mete
+    .git, venv, __pycache__, .pytest_cache y tests dentro de la imagen.
+  - No hay `HEALTHCHECK` para el servicio backend (sí lo tiene `db` en
+    docker-compose, pero no `backend`).
+  - No hay `CMD`/`ENTRYPOINT` propio — solo funciona porque docker-compose.yml
+    provee el `command`; la imagen no es ejecutable de forma standalone.
+
+FIX PROPUESTO: build multi-stage, usuario no-root, `.dockerignore`, healthcheck
+propio del backend, revisar si build-essential/libpq-dev/gdal-bin son
+realmente necesarios para asyncpg (probablemente no).
+
+
+================================================================================
+2. MODERADO
+================================================================================
+
+BACKEND
+--------------------------------------------------------------------------------
+[M-01] Cliente JWKS se recrea en cada request. `get_jwks_client()`
+(core/security.py) instancia un `PyJWKClient` nuevo en cada llamada a
+`obtener_usuario_actual`, anulando el cache interno de PyJWT — cada request
+autenticado hace su propio fetch HTTP al endpoint JWKS de Cognito. Debería ser
+un singleton a nivel de módulo (o con `@lru_cache`, igual que `get_settings`).
+
+[M-02] No se valida `token_use` ni `client_id` del JWT. `verify_aud=False`
+está deshabilitado sin nada que lo reemplace — un id_token (en vez de
+access_token) o un token de otra app client del mismo user pool sería aceptado.
+
+[M-03] Dependencias sin pinnear en requirements.txt. fastapi, uvicorn, asyncpg,
+pydantic-settings, redis, polyline, firebase-admin no tienen versión fijada
+(ni siquiera rango) y no hay lockfile. `cryptography==42.0.5` está desactualizado
+(≈feb 2024) pese a manejar directamente la verificación de firma de los JWT.
+
+[M-04] Redis está declarado como dependencia core del proyecto pero no se usa
+para nada — solo aparece en el health check (SET/GET de prueba). O se
+implementa cacheo real (ej. JWKS, perfiles, rate limiting) o se retira del
+stack para simplificar.
+
+[M-05] No hay un handler catch-all para excepciones no previstas. Solo están
+registrados AppError y asyncpg.PostgresError; cualquier otro error (KeyError,
+bug en un repo, etc.) cae al handler por defecto de Starlette. FastAPI no
+declara `debug=False` explícitamente, así que hoy probablemente no filtra
+tracebacks, pero es una propiedad implícita, no garantizada por un test.
+
+[M-06] Redis nunca se cierra en shutdown — `close_redis_client()` existe pero
+nadie la llama desde el `lifespan` (que solo gestiona el pool de Postgres).
+
+[M-07] Firebase se inicializa en tiempo de import (`main.py` vía
+`from app.core import firebase`), fuera del lifespan — si falta
+`firebase.json` o es inválido, la app entera falla al arrancar con un
+traceback crudo en vez de un log de startup controlado, inconsistente con
+cómo se maneja Postgres/Redis.
+
+[M-08] Health check sin autenticación expone información. `/` (routers/health.py)
+devuelve texto de excepciones crudo (`str(e)`) y strings de versión de
+Postgres/PostGIS a cualquiera, sin auth.
+
+[M-09] Matching de rutas — sin chequeo de direccionalidad. `search_trips`
+(trip_repo.py) solo exige que la ruta intersecte los buffers de origen y
+destino (`ST_Intersects`), sin verificar que el recorrido va de origen hacia
+destino en ese orden (ej. con `ST_LineLocatePoint`). Un viaje en sentido
+contrario podría matchear igual. Además, el radio de 500m está hardcodeado
+dos veces en vez de ser una constante/config.
+
+[M-10] Faltan constraints de integridad en esquema.sql:
+  - Sin CHECK que impida seats_requested <= 0 o price/seats_available < 0.
+  - Sin índice único parcial que impida solicitudes duplicadas pendientes/
+    aceptadas del mismo pasajero para el mismo viaje a nivel de BD (solo se
+    valida en código, de forma no atómica — se relaciona con 1.2).
+  - origin_lat/lng y dest_lat/lng duplican los datos de origin_geom/dest_geom
+    sin trigger/columna generada que los mantenga sincronizados — riesgo de
+    que diverjan.
+  - Sin trigger para `updated_at` — depende de que cada repo se acuerde de
+    setearlo manualmente en cada UPDATE.
+
+[M-11] RequestStatusUpdate.status es un `str` libre (schemas/request.py), no
+validado contra el CHECK constraint de la BD ni contra un Literal/Enum — un
+valor inválido cae directo al handler genérico de Postgres (500 feo) en vez
+de un 400 claro.
+
+[M-12] Validación de esquemas Pydantic incompleta: sin bounds en lat/lng, sin
+`gt=0` en price/seats_available, sin límite de longitud en strings que sí
+tienen límite en la BD (VARCHAR(255)/VARCHAR(100)) — un valor muy largo
+produce un error crudo de Postgres ("string data right truncation") en vez de
+un 422 controlado.
+
+[M-13] Cobertura de tests: ~92% del código sin ningún test. Solo existe
+`tests/api/test_health.py` (un test, camino feliz). No hay tests para
+creación/matching/cancelación de viajes, aceptar/rechazar solicitudes, auth,
+ni — crítico — nada que hubiera detectado los problemas de IDOR del punto 1.1.
+`agentes.md` solo marca test_profile.py como pendiente, pero en realidad falta
+todo.
+
+[M-14] Duplicación de código: el patrón "buscar token FCM → armar título/
+cuerpo → schedule_push_notification" se repite casi textual 4 veces entre
+request_service.py y trip_service.py — candidato a extraer un helper
+`notify_user()` en notification_service.py.
+
+[M-15] Sin limpieza de tokens FCM inválidos. `send_push_notification` atrapa
+cualquier excepción genérica y nunca distingue un token dado de baja
+(UnregisteredError) para limpiar `users.fcm_token` — tokens muertos se
+acumulan indefinidamente.
+
+[M-16] Envío de push notifications secuencial (loop) en vez de usar
+`send_multicast`/`send_each` de Firebase Admin al notificar a varios
+pasajeros a la vez (trip_service.cancel_trip).
+
+FRONTEND
+--------------------------------------------------------------------------------
+[M-17] Contrato de errores inconsistente en api_service.dart: unos métodos
+devuelven `null` en falla, otros `false`, otros `{'success': bool, 'message':
+...}`, otros lanzan una Exception genérica descartando el error real (`catch
+(e) { throw Exception('Error desconocido...'); }`). Sin tipo de resultado
+compartido (ApiResult<T>/Either), cada llamador tiene que conocer la
+convención particular de cada método — dificulta mucho el diagnóstico en
+producción.
+
+[M-18] El cliente calcula distancia/duración/polyline con Google Directions
+(google_maps.dart) y el backend aparentemente confía ciegamente en esos
+strings al publicar un viaje (api_service.dart, campos distanceText/
+durationText/encodedPolyline) en vez de recalcular/validar con PostGIS del
+lado servidor — riesgo de manipulación/desincronización de los datos de ruta
+publicados.
+
+[M-19] `_configureAmplify` en main.dart no tiene manejo de fallo — si
+`Amplify.configure` lanza excepción, la app queda colgada en el spinner de
+carga sin mensaje de error visible al usuario (rethrow sin captura en la capa
+de UI).
+
+[M-20] Prefijo de URL inconsistente: solo `actualizarTokenNotificaciones` usa
+`/api/` (api_service.dart:311); el resto de endpoints no lo usa — sugiere un
+error de copy-paste o una inconsistencia de ruteo en el backend a reconciliar.
+
+[M-21] Sin modelos tipados para respuestas de la API. Con la única excepción
+del modelo de chat (Mensaje, con fromJson/toJson), todo lo demás (perfil,
+viaje, solicitud) se pasa como `Map<String, dynamic>` crudo — sin seguridad de
+tipos, fácil introducir typos de claves que fallan en silencio. Es la mejora
+de mayor impacto para mantenibilidad de todo el frontend, y facilitaría
+también el fix de IDOR (tipar qué campos vienen realmente del servidor).
+
+[M-22] chat_provider.dart rompe el patrón de capas: habla directo con
+Firestore (`FirebaseFirestore.instance...`) en vez de pasar por un
+ChatService como el resto de los providers (que sí usan ApiService/
+AuthService/GoogleMapsService/StorageService).
+
+[M-23] Navegación 100% imperativa (`Navigator.push` + `MaterialPageRoute`),
+sin rutas nombradas ni go_router — no es "inconsistente" (se usa igual en
+todos lados) pero complica deep-linking y navegación disparada desde push
+notifications a futuro.
+
+[M-24] Barra de navegación inferior duplicada. Existe `navegacion_button.dart`
+(CustomBottomNavBar, con Riverpod, tema correcto) que NUNCA se importa en
+ningún lado. `main_screen.dart` reimplementa su propia bottom nav bar inline
+con su propia lógica de badge de no-leídos — riesgo de que ambas versiones
+diverjan con el tiempo.
+
+[M-25] Widgets reutilizables infrautilizados: `boton_principal.dart`
+(PrimaryButton) y `entrada_datos.dart` (CustomInputField) solo se usan en
+login — el resto de pantallas (signup, publicar_ruta, detalle_viaje,
+trip_card, precio_viaje) reimplementan su propio botón/input con estilos
+copy-pasteados casi idénticos.
+
+[M-26] Chat sin autorización server-side. chat.dart escribe/lee directo de
+Firestore con un ID de conversación armado en el cliente
+(`'${viajeId}_$miId'`), sin que el backend valide que ambas partes realmente
+pertenecen a ese viaje — toda la seguridad depende de las reglas de Firestore
+(no revisadas en este análisis, recomendable auditarlas aparte).
+
+[M-27] Prop-drilling en el wizard de publicar/buscar viaje: buscar_ubicacion →
+seleccionar_ruta → fecha_hora_viaje → precio_viaje pasan un
+`Map<String, dynamic> tripData` creciente por constructores en vez de un
+provider compartido de "viaje en progreso" — se pierde todo el flujo si la
+app se recarga o rota, y precio_viaje.dart accede a claves del mapa sin
+verificar que existan (puede lanzar excepción si se saltea un paso).
+
+[M-28] N+1 de llamadas API: mensajes_screen.dart hace fetch secuencial del
+perfil de cada pasajero en un loop (`_loadRealData`), con errores silenciados
+(`try {} catch (_) {}`) — no escala bien con muchos pasajeros y las fallas de
+carga de foto/datos no dan feedback.
+
+[M-29] Falta manejo de errores en algunas pantallas: `resultados_busqueda_
+viaje.dart` (_realizarBusqueda) no tiene try/catch alrededor del await a la
+API — si falla, el spinner de carga queda girando para siempre sin mensaje de
+error.
+
+[M-30] Validación de formularios incompleta: login.dart no valida nada
+client-side (confía 100% en el error de Cognito); signup_page.dart anuncia en
+el texto de la UI requisitos de contraseña (letra + número + carácter
+especial) que nunca se validan realmente en el cliente, solo la longitud.
+
+
+================================================================================
+3. MENOR — calidad de código, no bloqueante
+================================================================================
+
+BACKEND
+--------------------------------------------------------------------------------
+- `print` no se usa en ningún lado (bien, respeta la convención de agentes.md).
+- Imports/código muerto: `import asyncpg` sin usar en routers/health.py;
+  `update_fcm_token` importado sin usar en routers/profile.py; `Request` de
+  fastapi sin usar en core/database.py; funciones wrapper fetchrow/fetchval/
+  fetch/execute en database.py nunca usadas (los repos llaman directo a
+  conn.*); `get_active_trip_by_driver` en trip_repo.py sin usar (remanente
+  de antes del JOIN).
+- Valores hardcodeados: `"Usuario Cognito"` como nombre por defecto en
+  profile_repo.py (debería venir del schema/servicio, no de la capa SQL);
+  `'5.0' AS passenger_rating` fabricado en una query de request_repo.py;
+  radio de 500m hardcodeado dos veces en trip_repo.py.
+- `trips.distance_text` se selecciona en search_trips pero nunca se llena en
+  el INSERT — columna siempre NULL.
+- schemas/request.py tiene campos muertos (passenger_photo, passenger_rating)
+  que el cliente puede mandar pero la BD ya no los guarda (remanente del
+  esquema anterior, según la propia nota en agentes.md).
+- Logging sin estructura (texto plano, sin request-id/trace-id) — el propio
+  archivo logging.py ya lo marca como TODO para producción.
+- `conftest.py` define fixtures `mock_db`/`mock_redis` con `pytest-mock`, que
+  no está en requirements.txt — fallarían si algo las llamara (hoy no se usan).
+
+FRONTEND
+--------------------------------------------------------------------------------
+- `ruta_paginas.dart` es código muerto: pantalla/nav bar del tema viejo
+  (pre-refactor visual), nunca importada, con el routing interno roto
+  (siempre navega a ProfilePage sin importar el tab). Se puede borrar.
+- `print()` usado para logging de errores en vez de un logger estructurado:
+  storage.dart, profile_avatar.dart.
+- Mezcla de español/inglés en nombres de métodos/variables dentro del mismo
+  archivo (api_service.dart mezcla obtenerPerfil/publicarViaje con
+  getActiveTrip/getTripRequests) — no es un bug, pero dificulta el
+  onboarding y la búsqueda de código.
+- `_AmplifyConfigurado` en main.dart no sigue la convención lowerCamelCase de
+  Dart.
+- Dependencia `riverpod_annotation` declarada en pubspec.yaml pero sin uso
+  visible (no hay archivos @riverpod ni .g.dart en el código revisado).
+- Sin constraint de versión de Flutter SDK en pubspec.yaml (solo Dart SDK).
+- Colores hardcodeados fuera del tema en algunos lugares — en particular
+  seleccionar_ruta.dart define su propio naranja (`0xFFFF5900`) que ni
+  siquiera coincide con el naranja del tema oficial (`0xFFE85D2B`),
+  generando una inconsistencia visual notoria.
+- Riesgo de crash menor: lista_pasajeros_page.dart usa
+  `pasajeroNombre[0].toUpperCase()` sin verificar que el nombre no esté vacío.
+- Catch vacío en google_maps.dart (getDirections) que oculta errores reales
+  de red/parseo detrás de un simple "no se encontró ruta".
+- getAutocomplete/getPlaceDetails en google_maps.dart no tienen try/catch,
+  inconsistente con el resto del archivo.
+
+
+================================================================================
+4. PROPUESTA DE FASES DE REFACTOR
+================================================================================
+
+FASE 1 — Seguridad y correctness (bloqueante, hacer primero)
+  - Arreglar IDOR en todos los endpoints listados en 1.1 (backend), y
+    actualizar api_service.dart en el frontend para dejar de requerir pasar
+    esos IDs una vez el backend derive la identidad del JWT.
+  - Transacción/constraint atómico para evitar sobreventa de asientos (1.2).
+  - Filtro de expiración de viajes por departure_time (1.3).
+  - Descomentar Firebase.initializeApp() en main.dart (1.4) — la corrección
+    de mayor impacto y menor esfuerzo de todo este documento.
+  - Endurecer Dockerfile: usuario no-root, multi-stage, .dockerignore,
+    healthcheck (1.5).
+
+FASE 2 — Estabilidad
+  - Suite de tests para los flujos críticos: auth, creación/búsqueda/
+    matching de viajes, aceptar/rechazar solicitudes, cancelaciones — en
+    particular, tests que habrían detectado el IDOR de la Fase 1.
+  - Unificar el contrato de errores de api_service.dart (un solo tipo de
+    resultado/excepción en vez de null/false/throw mezclados).
+  - Handler catch-all de excepciones no previstas en FastAPI.
+  - Singleton para el cliente JWKS; validar token_use/client_id.
+
+FASE 3 — Deuda técnica estructurada
+  - Modelos tipados en Flutter (Trip, Profile, TripRequest) en vez de
+    Map<String, dynamic> crudo, alineados con los schemas de Pydantic.
+  - Rutas nombradas en Flutter (o adoptar go_router).
+  - Consolidar widgets duplicados: usar navegacion_button.dart en vez de la
+    bottom nav inline; usar boton_principal/entrada_datos en todas las
+    pantallas; borrar ruta_paginas.dart.
+  - Pinnear dependencias en requirements.txt; actualizar cryptography.
+  - Agregar constraints faltantes en esquema.sql (CHECK de cantidades
+    positivas, índice único parcial para solicitudes duplicadas).
+
+FASE 4 — Pulido
+  - Decidir convención de idioma (español o inglés) y normalizar nombres.
+  - Logging estructurado (JSON) con request-id.
+  - Decidir si Redis se usa de verdad (cacheo) o se retira del stack.
+  - Auditar reglas de seguridad de Firestore para el chat.
+  - Validar/recalcular distancia-duración-ruta en el backend con PostGIS en
+    vez de confiar en lo que manda el cliente.
+
+
+================================================================================
+Fin del documento.
+================================================================================

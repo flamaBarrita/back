@@ -1,0 +1,16 @@
+# Solo app/ y requirements.txt forman parte de la imagen
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.git
+venv
+.venv
+app/venv
+app/data
+app/firebase.json
+tests
+migrations
+requirements-dev.txt
+pytest.ini
+*.md
+.env

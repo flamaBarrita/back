@@ -1,0 +1,271 @@
+FALTANTES — Cambios hechos en el backend y pendientes para el frontend
+App de viajes compartidos (back_blabla + blablacar)
+Fecha: 2026-09-22 · Rama: backend-refactor-mejora-vanna (desde AnahuacFeatures)
+================================================================================
+
+
+PARTE 1 — CAMBIOS REALIZADOS EN EL BACKEND
+================================================================================
+
+Verificación: 46 tests pasan contra un PostGIS real. La imagen Docker se
+construye, corre como usuario no-root y queda "healthy". La migración se probó
+sobre el esquema viejo con datos inconsistentes.
+
+1.1 Seguridad: IDOR (MEJORA_VANNA 1.1)
+--------------------------------------------------------------------------------
+- Todos los endpoints toman la identidad del JWT (claim `sub`).
+- Las rutas NO cambiaron. Si el ID de la URL no es el del token → 403.
+    PUT   /profile/{user_id}
+    POST  /users/{user_id}
+    PATCH /usuarios/{usuario_id}/foto
+    POST  /trips/{driver_id}
+    GET   /trips/active/{driver_id}
+    GET   /mis-viajes/aprobados/{passenger_id}
+    PATCH /trips/{trip_id}/pasajeros/{passenger_id}/cancelar
+- La propiedad de viajes y solicitudes se verifica en la BD:
+    GET   /trips/{trip_id}/requests      → solo el conductor del viaje
+    PATCH /trips/{trip_id}/cancelar      → solo el conductor del viaje
+    PUT   /requests/{request_id}/status  → solo el conductor del viaje
+- POST /trips/{trip_id}/requests: el pasajero siempre es el usuario del token.
+  El backend ignora passenger_id, sender_id, passenger_name, passenger_photo y
+  passenger_rating del body. El nombre para la notificación se lee de la BD.
+- GET /profile/{user_id} sigue abierto a cualquier usuario autenticado (perfil
+  público: nombre, bio, preferencias, vehículos, foto).
+
+1.2 Sobreventa de asientos (MEJORA_VANNA 1.2)
+--------------------------------------------------------------------------------
+- `trips.seats_available` ahora significa "asientos que QUEDAN".
+- Aceptar una solicitud descuenta asientos dentro de una transacción con
+  SELECT ... FOR UPDATE. Si ya no alcanzan → 409 y la solicitud sigue pendiente.
+- Cuando un pasajero cancela, sus asientos se devuelven.
+- Un índice único impide solicitudes vigentes duplicadas (mismo pasajero y viaje).
+- Solo se pueden responder solicitudes en estado 'pendiente'.
+
+1.3 Expiración de viajes (MEJORA_VANNA 1.3)
+--------------------------------------------------------------------------------
+- `departure_time` se interpreta como hora de America/Mexico_City (APP_TIMEZONE).
+- Un viaje deja de aparecer en búsquedas a su hora de salida.
+- Sigue "activo" para el conductor 2 horas después de la salida
+  (TRIP_ACTIVE_GRACE_MINUTES=120). Después un job lo pasa a 'completado'.
+- El conductor ya no queda bloqueado para siempre sin poder publicar.
+- No se puede publicar un viaje con hora de salida en el pasado (400).
+- No se puede solicitar un viaje que ya salió (400).
+
+1.4 Docker (MEJORA_VANNA 1.5)
+--------------------------------------------------------------------------------
+- Dockerfile multi-stage con Python 3.12, usuario no-root, HEALTHCHECK y CMD
+  propio (uvicorn, 2 workers). Sin build-essential, libpq-dev ni gdal.
+- Nuevo backend/.dockerignore: solo entran app/ y requirements.txt.
+- docker-compose.yml: sin Redis, sin `command`, y con variables nuevas
+  (COGNITO_APP_CLIENT_ID, APP_TIMEZONE, TRIP_ACTIVE_GRACE_MINUTES, LOG_FORMAT).
+
+1.5 Moderados y menores del backend
+--------------------------------------------------------------------------------
+- [M-01] El cliente JWKS es un singleton (antes se recreaba en cada request).
+- [M-02] Se valida token_use == "access" y client_id (si se define
+  COGNITO_APP_CLIENT_ID).
+- [M-03] Dependencias fijadas: requirements.txt (runtime) y
+  requirements-dev.txt (tests). cryptography pasó de 42.0.5 a 50.0.1.
+- [M-04/M-06] Redis retirado del stack (código, dependencia y compose).
+- [M-05] Handler catch-all: errores no previstos → 500 genérico, sin
+  traceback. Violaciones de constraints → 400/409 en lugar de 500.
+- [M-07] Firebase se inicializa en el lifespan. Si falla, la API arranca
+  igual sin push y deja un error claro en el log.
+- [M-08] El health check `/` ya no expone versiones ni mensajes de error.
+  Responde 503 si la BD está caída.
+- [M-09] La búsqueda verifica el sentido de la ruta (ST_LineLocatePoint). El
+  radio es configurable (SEARCH_RADIUS_M=500). El conductor no ve su propio
+  viaje en la búsqueda.
+- [M-10] Constraints CHECK (precio >= 0, asientos >= 0, seats_requested > 0),
+  índice único parcial, triggers de updated_at y de sincronización de
+  lat/lng con las geometrías.
+- [M-11] RequestStatusUpdate.status solo acepta "aceptado" o "rechazado" (422).
+- [M-12] Validación de rangos de lat/lng, precio, asientos (1 a 8) y longitud
+  de textos. La foto debe ser una URL https (máximo 1024 caracteres).
+- [M-13] Tests nuevos: IDOR, asientos y concurrencia, expiración, búsqueda,
+  perfiles, JWT y health (46 en total).
+- [M-14/M-15/M-16] Un solo helper `notify_users`. Envío multicast
+  (send_each_for_multicast). Los tokens FCM dados de baja se borran solos.
+- Un mismo token FCM ya no queda en dos cuentas (cambio de cuenta en el mismo
+  teléfono).
+- [M-18 parcial] `distance_text` la calcula el servidor desde la ruta. Antes
+  siempre quedaba NULL.
+- Logging con request-id (header X-Request-ID) y formato JSON opcional.
+- Se eliminó código muerto: imports sin usar, wrappers de database.py,
+  get_active_trip_by_driver, fixtures con pytest-mock, el '5.0' fabricado de
+  passenger_rating y el nombre "Usuario Cognito" hardcodeado.
+- agentes.md actualizado con las reglas de autorización, asientos y fechas.
+
+1.6 Archivos nuevos o modificados
+--------------------------------------------------------------------------------
+  backend/app/core/*              (config, security, logging, database, firebase, exceptions)
+  backend/app/core/redis.py       ELIMINADO
+  backend/app/main.py
+  backend/app/routers/*
+  backend/app/services/*
+  backend/app/repositories/*
+  backend/app/schemas/*
+  backend/app/utils/time.py       NUEVO
+  backend/migrations/001_mejora_vanna.sql + README.md   NUEVOS
+  backend/tests/**                (conftest, api/, integration/)
+  backend/Dockerfile, backend/.dockerignore, backend/pytest.ini
+  backend/requirements.txt, backend/requirements-dev.txt
+  docker-compose.yml, esquema.sql, agentes.md, .gitignore
+
+
+PARTE 2 — PASOS OBLIGATORIOS ANTES DE DESPLEGAR EL BACKEND
+================================================================================
+
+[ ] 1. Aplicar la migración ANTES de levantar el backend nuevo:
+         docker compose exec -T db psql -U "$DB_USER" -d rides_db \
+           -v ON_ERROR_STOP=1 --single-transaction \
+           < backend/migrations/001_mejora_vanna.sql
+       La migración descuenta de `seats_available` los asientos ya aceptados.
+       Si se despliega el backend sin migrar, los asientos se contarían mal.
+
+[ ] 2. Agregar al .env (recomendado):
+         COGNITO_APP_CLIENT_ID=<id del app client de Cognito que usa Flutter>
+
+[ ] 3. Verificar que backend/app/firebase.json exista en el servidor y sea
+       legible por el usuario del contenedor (uid 999): chmod 644. Ahora se
+       monta como volumen de solo lectura en /run/secrets/firebase.json y ya
+       no entra en la imagen. Otra ruta: FIREBASE_CREDENTIALS_FILE en el .env.
+
+[ ] 4. docker compose up --build -d
+       Opcional: borrar el volumen viejo de Redis (docker volume ls).
+
+[x] 5. Commit de los cambios (rama backend-refactor-mejora-vanna).
+
+
+PARTE 3 — LO QUE FALTA EN EL FRONTEND (blablacar/blablacar)
+================================================================================
+
+La app actual SIGUE FUNCIONANDO con el backend nuevo: las rutas no cambiaron y
+los campos que sobran se ignoran. Estos son los pendientes, en orden de
+prioridad.
+
+3.1 CRÍTICO
+--------------------------------------------------------------------------------
+[ ] F-01 (1.4) Descomentar Firebase.initializeApp() en lib/main.dart:14-16,
+         antes de cualquier uso de Firebase. Sin esto no funcionan las push,
+         el chat (Firestore) ni la subida de fotos (Storage).
+
+[ ] F-02 (1.1) lib/services/api_service.dart — dejar de mandar campos que el
+         backend ya ignora:
+         - solicitarUnirse: quitar passenger_id, sender_id, passenger_name,
+           passenger_photo y passenger_rating. Solo enviar
+           {"seats_requested": n}.
+         - publicarViaje: quitar distance_text (ahora lo calcula el servidor).
+         Los IDs que van en la URL (userId, driverId, passengerId) SIGUEN siendo
+         necesarios, pero deben salir SIEMPRE de currentUserIdProvider. Si no
+         coinciden con el usuario del token, el backend responde 403.
+
+[ ] F-03 Manejar los nuevos códigos de respuesta. El mensaje para el usuario
+         viene en el campo "detail" del JSON:
+         - 403 → "No tienes permiso..." (no debería pasar en el uso normal).
+         - 409 al aceptar una solicitud → "No quedan asientos suficientes".
+         - 409 al responder → "Esta solicitud ya fue respondida o cancelada".
+         - 409 al cancelar un viaje → "El viaje ya no está activo" (antes 404).
+         - 409 al publicar → "Ya tienes un viaje activo...".
+         - 400 al publicar → "La hora de salida debe ser en el futuro".
+         - 400 al solicitar → viaje propio, sin asientos o viaje que ya salió.
+         - 422 → datos inválidos (asientos fuera de 1 a 8, precio negativo,
+           textos muy largos, foto que no es https, estado que no es
+           "aceptado"/"rechazado").
+         Hoy muchos métodos devuelven solo true/false y se pierde el motivo.
+
+3.2 AJUSTES POR CAMBIOS DE COMPORTAMIENTO
+--------------------------------------------------------------------------------
+[ ] F-04 `seats_available` ahora son los asientos que QUEDAN. Revisar textos
+         como "Solicitar X asientos disp." (trip_card.dart:200) y el
+         formulario de solicitud: no debe permitir pedir más asientos de los
+         disponibles.
+[ ] F-05 El viaje activo del conductor (GET /trips/active) devuelve null 2
+         horas después de la salida. mensajes_screen.dart debe mostrar
+         "sin viaje activo" y permitir publicar uno nuevo.
+[ ] F-06 La búsqueda ya no muestra viajes en sentido contrario, viajes que ya
+         salieron ni los viajes propios del conductor. Revisar el estado vacío
+         de resultados_busqueda_viaje.dart.
+[ ] F-07 Las solicitudes pendientes ya no traen `passenger_rating`. La app ya
+         usa '5.0' como fallback (mensajes_screen.dart:188). Mejor quitar el
+         rating falso de la UI hasta que exista un sistema real.
+[ ] F-08 `departure_time`: se puede seguir mandando la hora local sin zona
+         (precio_viaje.dart:42). El backend la interpreta como hora de CDMX.
+         Si se manda con offset, el backend la convierte.
+[ ] F-09 `distance_text` ahora viene lleno en la búsqueda ("10.5 km"). Se
+         puede mostrar en trip_card y detalle_viaje.
+[ ] F-10 La foto de perfil debe ser una URL https. Las de Firebase Storage lo
+         son, así que no se necesita cambio, solo confirmarlo.
+[ ] F-11 Llamar actualizarTokenNotificaciones después de cada login. El
+         backend le quita el token a la cuenta anterior del mismo teléfono.
+[ ] F-12 (M-20) El prefijo /api/ de actualizarTokenNotificaciones es correcto:
+         el backend lo define así. No es un error de copy-paste. Opcional:
+         unificarlo más adelante.
+
+3.3 MODERADOS DEL FRONTEND (de MEJORA_VANNA, sin tocar aún)
+--------------------------------------------------------------------------------
+[ ] M-17 Unificar el contrato de errores de api_service.dart (un solo tipo de
+         resultado, ApiResult<T> o excepción tipada con el "detail" del
+         backend) en lugar de mezclar null, false, Map y throw.
+[ ] M-19 Manejar el fallo de Amplify.configure en main.dart (hoy la app se
+         queda en el spinner).
+[ ] M-21 Modelos tipados (Trip, Profile, TripRequest) con fromJson, alineados
+         con los schemas de Pydantic, en lugar de Map<String, dynamic>.
+[ ] M-22 Crear un ChatService; chat_provider.dart no debe hablar directo con
+         Firestore.
+[ ] M-23 Rutas nombradas o go_router.
+[ ] M-24 Usar navegacion_button.dart (CustomBottomNavBar) y quitar la barra
+         inline de main_screen.dart.
+[ ] M-25 Usar PrimaryButton y CustomInputField en todas las pantallas.
+[ ] M-26 Auditar las reglas de seguridad de Firestore del chat. El ID de
+         conversación se arma en el cliente ('${viajeId}_$miId'). Las reglas
+         deben verificar que el usuario sea parte del viaje.
+[ ] M-27 Provider compartido para el wizard de publicar viaje en lugar de
+         pasar un Map tripData de pantalla en pantalla. Validar claves en
+         precio_viaje.dart.
+[ ] M-28 mensajes_screen.dart hace una llamada a /profile por cada pasajero
+         (N+1) y silencia los errores. Nota: GET /trips/{id}/requests ya
+         devuelve passenger_name y passenger_photo, así que muchas de esas
+         llamadas sobran.
+[ ] M-29 try/catch y mensaje de error en _realizarBusqueda
+         (resultados_busqueda_viaje.dart), para que el spinner no quede
+         girando para siempre.
+[ ] M-30 Validación de formularios: login.dart sin validación; signup_page.dart
+         anuncia requisitos de contraseña que no valida.
+
+3.4 MENORES DEL FRONTEND
+--------------------------------------------------------------------------------
+[ ] Borrar ruta_paginas.dart (código muerto).
+[ ] Reemplazar print() por un logger (storage.dart, profile_avatar.dart).
+[ ] Renombrar _AmplifyConfigurado a lowerCamelCase.
+[ ] Quitar riverpod_annotation de pubspec.yaml si no se usa.
+[ ] Agregar la restricción de versión de Flutter SDK en pubspec.yaml.
+[ ] Usar el naranja del tema (0xFFE85D2B) en lugar de 0xFFFF5900
+    (seleccionar_ruta.dart).
+[ ] lista_pasajeros_page.dart: validar que el nombre no esté vacío antes de
+    pasajeroNombre[0].
+[ ] google_maps.dart: no silenciar errores en getDirections y agregar try/catch
+    a getAutocomplete/getPlaceDetails.
+[ ] Decidir una convención de idioma (español/inglés) para nombres de métodos.
+
+
+PARTE 4 — PENDIENTES DEL BACKEND (no bloqueantes)
+================================================================================
+[x] `firebase.json` ya no entra en la imagen: se monta como volumen de solo
+    lectura (docker-compose.yml, FIREBASE_CREDENTIALS_PATH=/run/secrets/...).
+[ ] `duration_text` sigue viniendo del cliente. Calcularlo en el servidor
+    requiere un servicio de ruteo (Google Directions u OSRM).
+[ ] Las rutas mezclan español e inglés (/usuarios, /mis-viajes, /trips...).
+    Unificarlas rompe la app, así que conviene hacerlo junto con el frontend
+    (opcionalmente con rutas /me).
+[ ] Borrar las carpetas locales backend/app/venv y backend/app/data/redis_data.
+    Ya no entran en la imagen.
+[x] Tests de integración en CI con PostGIS (.github/workflows/backend-tests.yml).
+    También verifica que esquema.sql aplica y que la migración no se repite.
+[x] La migración 001 crea created_at/updated_at si faltan (el backend viejo no
+    las usaba y los triggers de updated_at fallarían sin ellas) y agrega los
+    índices de consulta. Probada sobre un esquema viejo con datos inconsistentes.
+
+================================================================================
+Fin del documento.
+================================================================================

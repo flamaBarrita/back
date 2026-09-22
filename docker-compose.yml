@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # --- BASE DE DATOS (PostGIS) ---
   db:
@@ -23,19 +21,9 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- CACHÉ (Redis) ---
-  redis:
-    image: redis:7-alpine
-    container_name: rides_redis
-    restart: unless-stopped
-    # PERSISTENCIA: Obligamos a Redis a guardar en disco cada cambio, no solo en RAM
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    networks:
-      - rides_network
-
   # --- BACKEND (FastAPI) ---
+  # El comando de arranque (uvicorn con 2 workers) y el healthcheck están en
+  # el Dockerfile.
   backend:
     build:
       context: ./backend
@@ -43,25 +31,28 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://${DB_USER}:${DB_PASS}@db:5432/rides_db
-      REDIS_URL: redis://redis:6379/0
       COGNITO_REGION: ${COGNITO_REGION}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID}
+      COGNITO_APP_CLIENT_ID: ${COGNITO_APP_CLIENT_ID:-}
+      APP_TIMEZONE: ${APP_TIMEZONE:-America/Mexico_City}
+      TRIP_ACTIVE_GRACE_MINUTES: ${TRIP_ACTIVE_GRACE_MINUTES:-120}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      FIREBASE_CREDENTIALS_PATH: /run/secrets/firebase.json
+    # Las credenciales de Firebase no entran en la imagen: se montan en solo
+    # lectura. Si el archivo falta, la API arranca igual sin notificaciones push.
+    volumes:
+      - ${FIREBASE_CREDENTIALS_FILE:-./backend/app/firebase.json}:/run/secrets/firebase.json:ro
     depends_on:
       db:
         condition: service_healthy # Espera a que Postgres pase el test de arriba
-      redis:
-        condition: service_started
     networks:
       - rides_network
     ports:
       - "8000:8000" # Único puerto expuesto a internet
-    # Comando de PRODUCCIÓN: Quitamos el --reload y agregamos workers
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 
 # Volúmenes administrados por Docker (Máxima seguridad y persistencia)
 volumes:
   pg_data:
-  redis_data:
 
 networks:
   rides_network:

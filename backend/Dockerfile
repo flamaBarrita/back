@@ -1,28 +1,37 @@
-# Usamos 'slim' porque es ligera pero contiene lo necesario para Debian
-FROM python:3.11-slim-bookworm
+# syntax=docker/dockerfile:1
 
-# 1. Optimizaciones de Python para Contenedores
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# ---------- Etapa 1: instalar dependencias en un virtualenv ----------
+FROM python:3.12-slim-bookworm AS builder
 
-# 2. Instalación de dependencias de C para Geoespacial (PostGIS)
-# Esto es CRUCIAL. Sin estas librerías, SQLAlchemy/GeoAlchemy fallarán en Linux.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    binutils \
-    libproj-dev \
-    gdal-bin \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# asyncpg, cryptography, etc. se instalan como wheels precompilados, por eso
+# no hacen falta build-essential, libpq-dev ni gdal (PostGIS vive en la BD).
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# ---------- Etapa 2: imagen final mínima ----------
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
 
 WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=app:app app ./app
 
-# 3. Instalación de paquetes de Python
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# 4. Copiamos el código
-COPY . .
+USER app
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=4).status == 200 else 1)"
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

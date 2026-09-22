@@ -1,4 +1,9 @@
 #ignorar variables
 .env
-/home/flama/Documents/back_blabla/backend/app/firebase.json
 backend/app/firebase.json
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
