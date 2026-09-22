@@ -72,6 +72,7 @@ Definidas en `.env` y consumidas por `docker-compose.yml`:
 - `APP_TIMEZONE` (default `America/Mexico_City`)
 - `TRIP_ACTIVE_GRACE_MINUTES` (default `120`)
 - `LOG_FORMAT` (`json` en docker-compose, `text` por defecto), `LOG_LEVEL`
+- `POSTGIS_IMAGE` (solo docker-compose; default `postgis/postgis:15-3.4`, en ARM usar `imresamu/postgis:15-3.4`)
 - `FIREBASE_ENABLED`, `FIREBASE_CREDENTIALS_PATH` (default `app/firebase.json`; en Docker, `/run/secrets/firebase.json`, montado desde `FIREBASE_CREDENTIALS_FILE`, por defecto `./backend/app/firebase.json`)
 - También existen `SEARCH_RADIUS_M` (500) y `TRIP_EXPIRATION_INTERVAL_SECONDS` (300).
 - `DATABASE_URL` se construye en `docker-compose.yml`.

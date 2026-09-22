@@ -125,6 +125,8 @@ PARTE 2 — PASOS OBLIGATORIOS ANTES DE DESPLEGAR EL BACKEND
 
 [ ] 2. Agregar al .env (recomendado):
          COGNITO_APP_CLIENT_ID=<id del app client de Cognito que usa Flutter>
+       En servidores ARM (OCI Ampere A1) además:
+         POSTGIS_IMAGE=imresamu/postgis:15-3.4
 
 [ ] 3. Verificar que backend/app/firebase.json exista en el servidor y sea
        legible por el usuario del contenedor (uid 999): chmod 644. Ahora se

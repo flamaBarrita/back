@@ -1,7 +1,9 @@
 services:
   # --- BASE DE DATOS (PostGIS) ---
   db:
-    image: postgis/postgis:15-3.4
+    # postgis/postgis solo existe para amd64. En servidores ARM (OCI Ampere A1)
+    # definir POSTGIS_IMAGE=imresamu/postgis:15-3.4 (misma imagen, multi-arch).
+    image: ${POSTGIS_IMAGE:-postgis/postgis:15-3.4}
     container_name: rides_db
     restart: unless-stopped
     environment:
